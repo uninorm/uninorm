@@ -1,0 +1,16 @@
+[package]
+name = "uninorm-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+unicode-normalization = { workspace = true }
+hfs_nfd = { workspace = true }
+walkdir = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

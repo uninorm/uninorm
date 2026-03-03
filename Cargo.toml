@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/uninorm-core",
+    "crates/uninorm-cli",
+]
+resolver = "2"
+
+[workspace.dependencies]
+uninorm-core = { path = "crates/uninorm-core" }
+unicode-normalization = "0.1.25"
+hfs_nfd = "2.0.0"
+walkdir = "2.5.0"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "macros"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18"
+arboard = "3"
