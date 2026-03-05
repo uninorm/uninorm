@@ -4,6 +4,21 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crate::normalize::{to_nfc, to_nfc_filename, needs_filename_conversion};
 
+/// Check if two paths refer to the same filesystem inode.
+/// Used to detect the APFS case where NFD and NFC forms of the same name
+/// both resolve to the same file (normalization-insensitive lookup).
+#[cfg(unix)]
+fn same_inode(p1: &Path, p2: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(p1), std::fs::metadata(p2)) {
+        (Ok(m1), Ok(m2)) => m1.ino() == m2.ino() && m1.dev() == m2.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_inode(_p1: &Path, _p2: &Path) -> bool { false }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionOptions {
     pub convert_filenames: bool,
@@ -69,19 +84,40 @@ pub async fn convert_path(
             let nfc_name = to_nfc_filename(&file_name);
             let new_path = entry.path().with_file_name(&nfc_name);
 
-            if new_path.exists() && new_path != entry.path() {
+            // On APFS/HFS+ the NFC form resolves to the same inode as the NFD
+            // form (normalization-insensitive lookup), so new_path.exists() is
+            // true even though no *different* file is there.  Only treat it as
+            // a conflict when it resolves to a genuinely different file.
+            let is_conflict = new_path.exists() && !same_inode(entry.path(), &new_path);
+
+            if is_conflict {
                 stats.errors.push(format!(
                     "Rename conflict: {} already exists",
                     new_path.display()
                 ));
             } else if !opts.dry_run {
-                if let Err(e) = tokio::fs::rename(entry.path(), &new_path).await {
-                    stats.errors.push(format!(
+                // Two-step rename: NFD → tmp → NFC
+                // A direct NFD→NFC rename is a no-op on normalization-insensitive
+                // filesystems (APFS default volume).  Moving through a neutral
+                // temp name forces the directory entry to be rewritten with the
+                // NFC bytes.
+                let parent = entry.path().parent().unwrap_or(entry.path());
+                let tmp = parent.join(format!(".uninorm_tmp_{}", stats.files_scanned));
+                match tokio::fs::rename(entry.path(), &tmp).await {
+                    Ok(_) => match tokio::fs::rename(&tmp, &new_path).await {
+                        Ok(_) => stats.files_renamed += 1,
+                        Err(e) => {
+                            let _ = tokio::fs::rename(&tmp, entry.path()).await; // restore
+                            stats.errors.push(format!(
+                                "Rename failed {}: {e}",
+                                entry.path().display()
+                            ));
+                        }
+                    },
+                    Err(e) => stats.errors.push(format!(
                         "Rename failed {}: {e}",
                         entry.path().display()
-                    ));
-                } else {
-                    stats.files_renamed += 1;
+                    )),
                 }
             } else {
                 stats.files_renamed += 1; // count in dry-run too
