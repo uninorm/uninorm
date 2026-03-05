@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      # ── CLI universal binary ──────────────────────────────────────────────
+      - name: Build CLI (arm64)
+        run: cargo build --release --target aarch64-apple-darwin -p uninorm-cli
+
+      - name: Build CLI (x86_64)
+        run: cargo build --release --target x86_64-apple-darwin -p uninorm-cli
+
+      - name: Lipo CLI → universal
+        run: |
+          lipo -create \
+            target/aarch64-apple-darwin/release/uninorm \
+            target/x86_64-apple-darwin/release/uninorm \
+            -output uninorm
+          chmod +x uninorm
+          zip uninorm-macos-universal.zip uninorm
+
+      # ── GUI .app bundle ───────────────────────────────────────────────────
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build GUI .app bundle
+        run: cargo bundle --release --package uninorm-gui
+
+      - name: Zip .app
+        run: |
+          cd target/release/bundle/osx
+          zip -r ../../../../uninorm-gui.app.zip uninorm.app
+
+      # ── GitHub Release ────────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            uninorm-macos-universal.zip
+            uninorm-gui.app.zip
+          generate_release_notes: true
+
+      # ── Update Homebrew tap ───────────────────────────────────────────────
+      - name: Update Homebrew formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          SHA=$(shasum -a 256 uninorm-macos-universal.zip | cut -d' ' -f1)
+          VERSION=${GITHUB_REF_NAME#v}
+          URL="https://github.com/sts07142/mac-uninorm/releases/download/${GITHUB_REF_NAME}/uninorm-macos-universal.zip"
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/sts07142/homebrew-uninorm.git" tap-repo
+          cd tap-repo
+
+          sed -i '' "s|url \".*\"|url \"${URL}\"|" Formula/uninorm.rb
+          sed -i '' "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/uninorm.rb
+          sed -i '' "s|version \".*\"|version \"${VERSION}\"|" Formula/uninorm.rb
+
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git commit -am "Bump uninorm to ${GITHUB_REF_NAME}"
+          git push
