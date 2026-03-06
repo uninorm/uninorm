@@ -2,6 +2,11 @@
 name = "uninorm-core"
 version = "0.1.0"
 edition = "2021"
+description = "Core library for NFD→NFC Unicode normalization of filenames and text content"
+license = "MIT"
+repository = "https://github.com/uninorm/uninorm"
+keywords = ["unicode", "nfc", "nfd", "normalization", "filename"]
+categories = ["filesystem", "text-processing"]
 
 [dependencies]
 unicode-normalization = { workspace = true }
@@ -9,8 +14,10 @@ hfs_nfd = { workspace = true }
 walkdir = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
 
 [dev-dependencies]
 tempfile = "3"

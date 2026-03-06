@@ -1,6 +1,6 @@
-# mac-uninorm
+# uninorm
 
-Converts Unicode NFD filenames and text to NFC on macOS.
+Converts Unicode NFD filenames and text to NFC — works on macOS, Linux, and Windows.
 
 macOS HFS+/APFS stores filenames in a non-standard NFD variant, causing Korean, Japanese kana, and accented Latin characters to appear broken on Linux and Windows.
 
@@ -8,14 +8,12 @@ macOS HFS+/APFS stores filenames in a non-standard NFD variant, causing Korean, 
 
 ---
 
-## CLI
-
-### Install
+## Install
 
 **Homebrew (recommended):**
 
 ```bash
-brew tap sts07142/uninorm
+brew tap uninorm/uninorm
 brew install uninorm
 ```
 
@@ -25,17 +23,22 @@ brew install uninorm
 cargo install --path crates/uninorm-cli
 ```
 
-### Usage
+---
+
+## Quick start
 
 ```bash
-# Preview changes (no files modified)
-uninorm files ~/Downloads --dry-run
+# Preview changes in current directory (nothing is modified)
+uninorm files --dry-run
 
-# Rename files and folders recursively
+# Rename all NFD filenames under a path
 uninorm files ~/Downloads
 
-# Also convert text inside files
-uninorm files ~/Downloads --content
+# Watch a directory and auto-rename files as they arrive
+uninorm watch ~/Downloads
+
+# View recent watch log
+uninorm log
 
 # Convert clipboard text
 uninorm clipboard
@@ -44,7 +47,11 @@ uninorm clipboard
 uninorm check "東京"
 ```
 
-### Options for `files`
+Full reference: [docs/cli.md](docs/cli.md)
+
+---
+
+## `files` options
 
 | Flag | Default | Description |
 |---|---|---|
@@ -52,57 +59,7 @@ uninorm check "東京"
 | `-r / --recursive` | true | Recurse into subdirectories |
 | `--content` | false | Convert text inside files too |
 | `--follow-symlinks` | false | Follow symbolic links |
-
----
-
-## GUI (macOS menu bar app)
-
-A macOS menu bar app that watches folders and automatically converts NFD filenames to NFC as files are created or renamed.
-
-### Install
-
-**From source (requires Rust + macOS):**
-
-```bash
-# Run directly
-
-# Build a distributable .app bundle (requires cargo-bundle)
-cargo install cargo-bundle
-make bundle
-# → target/release/bundle/osx/uninorm.app
-```
-
-### Features
-
-| Feature | Description |
-|---|---|
-| **Menu bar** | Runs as a menu bar icon (hidden from Dock) |
-| **File browser** | Browse files in Hierarchy / List / Icon / Gallery view |
-| **Watched paths** | Register folders to monitor for NFD filenames |
-| **Auto-convert** | Automatically converts filenames on Create/Rename events |
-| **Scan All** | Manually scan all watched paths for existing NFD filenames |
-| **Bookmarks** | Save frequently-used paths for quick navigation and one-click add |
-| **Activity log** | In-app log + persistent log file at `~/.config/uninorm/uninorm.log` |
-| **Login auto-start** | Optional LaunchAgent to start at login |
-| **Language** | English / Korean UI (persisted in config) |
-| **Drag & drop** | Drag folders onto the window to add them to watched paths |
-
-### Configuration
-
-Config is stored at `~/.config/uninorm/config.json`:
-
-```json
-{
-  "watched_paths": ["/Users/you/Downloads"],
-  "inactive_paths": [],
-  "bookmarks": [],
-  "lang": "English"
-}
-```
-
-### Why doesn't auto-convert always trigger?
-
-APFS normalizes filenames to NFC when written, so new files created on a modern Mac are already NFC. Auto-convert triggers when NFD filenames arrive from external sources (USB drives, network shares, old HFS+ volumes). Use **Scan All** to convert any existing NFD files.
+| `--exclude <PATTERN>` | — | Skip entries matching name (repeatable) |
 
 ---
 
@@ -112,16 +69,16 @@ macOS decomposes characters like `강` (U+AC15) into separate code points (`ᄀ`
 
 `uninorm` composes them back into precomposed NFC form, which other systems expect.
 
-> **Note:** macOS uses a non-standard HFS+ NFD for filenames that differs from Unicode Standard Annex #15 NFD. `uninorm` handles both variants correctly.
+> **Note:** macOS uses a non-standard HFS+ NFD for filenames that differs from Unicode Standard Annex #15 NFD. `uninorm` handles both variants correctly. On Linux and Windows, standard Unicode NFC normalization is used.
 
 ---
 
 ## Workspace
 
-| Crate | Description | Status |
-|---|---|---|
-| `uninorm-core` | Core library (cross-platform) | Done |
-| `uninorm-cli` | CLI binary | Done |
+| Crate | Description |
+|---|---|
+| `uninorm-core` | Core library (cross-platform) |
+| `uninorm-cli` | CLI binary |
 
 ---
 

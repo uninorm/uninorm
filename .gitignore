@@ -23,3 +23,7 @@ rust-project.json
 
 
 # End of https://www.toptal.com/developers/gitignore/api/rust,rust-analyzer
+
+# macOS metadata
+.DS_Store
+**/.DS_Store

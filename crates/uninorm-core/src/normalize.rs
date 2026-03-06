@@ -161,4 +161,126 @@ mod tests {
         assert_eq!(to_nfc_filename(s), s);
         assert!(!needs_filename_conversion(s));
     }
+
+    // ── Empty / whitespace ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_empty_string() {
+        assert_eq!(to_nfc(""), "");
+        assert_eq!(to_nfc_filename(""), "");
+        assert!(is_nfc(""));
+        assert!(!needs_filename_conversion(""));
+    }
+
+    #[test]
+    fn test_whitespace_unchanged() {
+        let s = "  \t\n ";
+        assert_eq!(to_nfc(s), s);
+        assert!(is_nfc(s));
+    }
+
+    // ── is_nfc correctness ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_nfc_false_for_latin_nfd() {
+        assert!(!is_nfc("e\u{0301}"));    // é in NFD
+        assert!(!is_nfc("n\u{0303}"));    // ñ in NFD
+        assert!(!is_nfc("u\u{0308}"));    // ü in NFD
+    }
+
+    #[test]
+    fn test_is_nfc_false_for_korean_hfs_nfd() {
+        let nfd = "\u{1100}\u{1161}\u{11BC}"; // 강 in HFS+ NFD
+        assert!(!is_nfc(nfd));
+    }
+
+    #[test]
+    fn test_is_nfc_false_for_japanese_nfd() {
+        assert!(!is_nfc("\u{304B}\u{3099}")); // が decomposed
+    }
+
+    #[test]
+    fn test_is_nfc_true_for_nfc_strings() {
+        assert!(is_nfc("hello"));
+        assert!(is_nfc("café"));     // NFC é (U+00E9)
+        assert!(is_nfc("강남구"));
+        assert!(is_nfc("が"));
+    }
+
+    // ── needs_filename_conversion: NFC input returns false ────────────────────
+
+    #[test]
+    fn test_needs_conversion_nfc_is_false() {
+        assert!(!needs_filename_conversion("café"));
+        assert!(!needs_filename_conversion("강남구"));
+        assert!(!needs_filename_conversion("ガジェット"));
+        assert!(!needs_filename_conversion("hello.txt"));
+    }
+
+    // ── Idempotency ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_to_nfc_idempotent() {
+        let nfd = "cafe\u{0301}";
+        let once = to_nfc(nfd);
+        assert_eq!(to_nfc(&once), once);
+    }
+
+    #[test]
+    fn test_to_nfc_filename_idempotent() {
+        let nfd = "\u{1100}\u{1161}\u{11BC}"; // 강 in HFS+ NFD
+        let once = to_nfc_filename(nfd);
+        assert_eq!(to_nfc_filename(&once), once);
+    }
+
+    // ── Mixed scripts in one string ───────────────────────────────────────────
+
+    #[test]
+    fn test_mixed_scripts_filename() {
+        // Korean + Latin + Japanese, all in HFS+ NFD combining form
+        let nfd = "\u{1100}\u{1161}\u{11BC} cafe\u{0301} \u{30AB}\u{3099}";
+        let nfc = to_nfc_filename(nfd);
+        assert_eq!(nfc, "강 café ガ");
+        assert!(is_nfc(&nfc));
+    }
+
+    // ── CJK Unified Ideographs (already NFC, no conversion) ──────────────────
+
+    #[test]
+    fn test_cjk_unchanged() {
+        let cjk = "日本語中文한자";
+        assert_eq!(to_nfc(cjk), cjk);
+        assert_eq!(to_nfc_filename(cjk), cjk);
+        assert!(is_nfc(cjk));
+        assert!(!needs_filename_conversion(cjk));
+    }
+
+    // ── Emoji (pre-composed, already NFC) ─────────────────────────────────────
+
+    #[test]
+    fn test_emoji_unchanged() {
+        let emoji = "🦀🎉✅";
+        assert_eq!(to_nfc(emoji), emoji);
+        assert_eq!(to_nfc_filename(emoji), emoji);
+        assert!(is_nfc(emoji));
+    }
+
+    // ── Filename with path separators and extensions ──────────────────────────
+
+    #[test]
+    fn test_filename_with_extension_and_nfd() {
+        // "résumé.pdf" with both é in NFD
+        let nfd = "re\u{0301}sume\u{0301}.pdf";
+        assert_eq!(to_nfc(nfd), "résumé.pdf");
+        assert_eq!(to_nfc_filename(nfd), "résumé.pdf");
+    }
+
+    // ── Unicode numbers / symbols unchanged ───────────────────────────────────
+
+    #[test]
+    fn test_numbers_and_symbols_unchanged() {
+        let s = "123 !@#$%^&*()_+-=[]{}|;':\",./<>?";
+        assert_eq!(to_nfc(s), s);
+        assert!(!needs_filename_conversion(s));
+    }
 }
