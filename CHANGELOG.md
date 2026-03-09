@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+#### uninorm-core
+- `ConversionOptions.exclude_patterns`: skip files/directories whose name matches any pattern
+- Atomic content write: content conversion now writes to a temp file then renames to prevent partial writes
+- 100 MB guard: files larger than 100 MB are silently skipped during content conversion
+
+#### uninorm-cli
+- `--exclude <PATTERN>` flag for `uninorm files` (repeatable: `--exclude .git --exclude node_modules`)
+
+---
+
 ## [0.1.0] — 2026-03-05
 
 ### Added
