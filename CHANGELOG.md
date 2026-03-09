@@ -22,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `uninorm files --dry-run` — preview changes without modifying files
 - `uninorm files --content` — also convert text content inside files
 - `uninorm files --exclude <PATTERN>` — skip matching names (repeatable: `--exclude .git --exclude node_modules`)
+- `uninorm watch [PATH...]` — watch paths and automatically convert NFD filenames as files appear or are renamed
+- `uninorm watch --exclude <PATTERN>` — exclude patterns from watch mode
+- `uninorm log [-n N]` — show recent conversion log (default: last 50 entries); log stored at `~/.config/uninorm/uninorm.log`
 - `uninorm clipboard` — convert clipboard text to NFC
 - `uninorm check <TEXT>` — exit 1 if text is not NFC
 

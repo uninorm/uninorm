@@ -7,6 +7,7 @@
 - [`files`](#files) — Batch rename files/folders (and optionally convert content)
 - [`watch`](#watch) — Real-time watcher: auto-rename files as they appear
 - [`log`](#log) — View recent conversion log
+- [`status`](#status) — Show watcher status (PID, paths, recent activity)
 - [`clipboard`](#clipboard) — Convert clipboard text
 - [`check`](#check) — Check if text is NFC-normalized
 
@@ -167,6 +168,44 @@ uninorm log -n 99999 | less
 
 (3 total entries, showing last 3)
 ```
+
+---
+
+## `status`
+
+Show the current state of the `watch` daemon: whether it is running, its PID, the paths being watched, and the most recent log activity.
+
+```
+uninorm status
+```
+
+**Examples**
+
+```bash
+uninorm status
+```
+
+**Sample output (watcher running)**
+
+```
+Watcher running  (PID 12345, started 2024-03-09 14:22:00)
+
+Watched paths:
+  /Users/you/Downloads
+  /Users/you/Desktop
+
+Recent activity:
+  [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
+  [2024-03-09 14:30:02] Renamed: café.txt → café.txt
+```
+
+**Sample output (no watcher)**
+
+```
+No watcher is running.
+```
+
+The watcher state is stored at `~/.config/uninorm/watch.state` and is written on `watch` start / removed on `Ctrl+C`. Stale state files (process no longer alive) are automatically cleaned up.
 
 ---
 

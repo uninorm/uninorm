@@ -10,7 +10,7 @@ uninorm-core = { path = "crates/uninorm-core" }
 unicode-normalization = "0.1.25"
 hfs_nfd = "2.0.0"   # only linked on macOS via target cfg in uninorm-core
 walkdir = "2.5.0"
-tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "io-util", "macros", "signal", "sync"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
