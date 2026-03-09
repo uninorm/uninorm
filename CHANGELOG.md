@@ -11,8 +11,7 @@
 
 #### uninorm-cli
 - `--exclude <PATTERN>` flag for `uninorm files` (repeatable: `--exclude .git --exclude node_modules`)
-
----
+- `path` argument now defaults to `.` (current directory); `uninorm files` works without arguments
 
 ## [0.1.0] — 2026-03-05
 
