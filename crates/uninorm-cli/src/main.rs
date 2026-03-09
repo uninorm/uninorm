@@ -20,7 +20,8 @@ struct Cli {
 enum Commands {
     /// Convert file/folder names (and optionally content) under a path
     Files {
-        /// Path to convert (file or directory)
+        /// Path to convert (file or directory) [default: current directory]
+        #[arg(default_value = ".")]
         path: PathBuf,
 
         /// Preview changes without renaming or writing anything
