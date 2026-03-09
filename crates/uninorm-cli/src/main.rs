@@ -38,6 +38,10 @@ enum Commands {
         /// Follow symbolic links
         #[arg(long)]
         follow_symlinks: bool,
+
+        /// Exclude entries whose name matches this pattern (repeatable: --exclude .git --exclude node_modules)
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
     },
 
     /// Convert clipboard text from NFD to NFC and write it back
@@ -61,9 +65,17 @@ async fn main() -> Result<()> {
             recursive,
             content,
             follow_symlinks,
+            exclude,
         } => {
             if !path.exists() {
                 anyhow::bail!("Path does not exist: {}", path.display());
+            }
+
+            if dry_run {
+                println!("[dry-run] No files will be modified.");
+            }
+            if !exclude.is_empty() {
+                println!("Excluding: {}", exclude.join(", "));
             }
 
             let opts = ConversionOptions {
@@ -72,11 +84,8 @@ async fn main() -> Result<()> {
                 dry_run,
                 recursive,
                 follow_symlinks,
+                exclude_patterns: exclude,
             };
-
-            if dry_run {
-                println!("[dry-run] No files will be modified.");
-            }
 
             let pb = ProgressBar::new_spinner();
             pb.set_style(
