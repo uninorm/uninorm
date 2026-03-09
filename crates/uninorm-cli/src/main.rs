@@ -106,6 +106,9 @@ async fn main() -> Result<()> {
 
             pb.finish_and_clear();
             print_stats(&stats, dry_run);
+            if !stats.errors.is_empty() {
+                std::process::exit(1);
+            }
         }
 
         Commands::Clipboard => {
