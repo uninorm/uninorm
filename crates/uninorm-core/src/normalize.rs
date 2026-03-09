@@ -6,11 +6,23 @@ pub fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// Convert a filename from HFS+ NFD to NFC.
-/// macOS HFS+/APFS uses a non-standard NFD variant for filenames.
-/// This correctly handles Korean Hangul jamo and other HFS+ quirks.
+/// Convert a filename from NFD to NFC.
+///
+/// On macOS: uses `hfs_nfd` to handle the HFS+/APFS non-standard NFD variant,
+/// which correctly composes Korean Hangul jamo and other HFS+ quirks.
+///
+/// On Linux/Windows: uses standard Unicode NFC normalization, which is correct
+/// for those filesystems (ext4, NTFS, etc. store filenames as-is).
 pub fn to_nfc_filename(s: &str) -> String {
-    hfs_nfd::compose_from_hfs_nfd(s)
+    #[cfg(target_os = "macos")]
+    {
+        hfs_nfd::compose_from_hfs_nfd(s)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        s.nfc().collect()
+    }
 }
 
 /// Returns true if the string is already in NFC form.
@@ -18,9 +30,9 @@ pub fn is_nfc(s: &str) -> bool {
     unicode_normalization::is_nfc(s)
 }
 
-/// Returns true if the filename needs HFS+ NFD → NFC conversion.
+/// Returns true if the filename needs NFD → NFC conversion.
 pub fn needs_filename_conversion(s: &str) -> bool {
-    hfs_nfd::compose_from_hfs_nfd(s) != s
+    to_nfc_filename(s) != s
 }
 
 #[cfg(test)]
