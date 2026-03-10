@@ -23,8 +23,7 @@ struct Cli {
 enum Commands {
     /// Convert file/folder names (and optionally content) under a path
     Files {
-        /// Path to convert (file or directory) [default: current directory]
-        #[arg(default_value = ".")]
+        /// Path to convert (file or directory)
         path: PathBuf,
 
         /// Preview changes without renaming or writing anything
@@ -50,8 +49,8 @@ enum Commands {
 
     /// Watch paths and automatically convert NFD filenames as files appear or are renamed
     Watch {
-        /// Paths to watch [default: current directory]
-        #[arg(default_value = ".")]
+        /// One or more paths to watch
+        #[arg(required = true)]
         paths: Vec<PathBuf>,
 
         /// Exclude entries whose name matches this pattern (repeatable)

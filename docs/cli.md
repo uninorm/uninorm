@@ -18,14 +18,14 @@
 Recursively scan a directory (or a single file) and rename any NFD filenames to NFC. Optionally convert text content inside files.
 
 ```
-uninorm files [PATH] [OPTIONS]
+uninorm files PATH [OPTIONS]
 ```
 
 **Arguments**
 
-| Argument | Default | Description |
-|---|---|---|
-| `PATH` | `.` (current directory) | File or directory to process |
+| Argument | Description |
+|---|---|
+| `PATH` | File or directory to process (required) |
 
 **Options**
 
@@ -79,14 +79,14 @@ Exit code is `1` if any rename or write error occurred.
 Watch one or more directories and automatically rename files from NFD to NFC as they are created or renamed. Uses the native filesystem event API (FSEvents on macOS, inotify on Linux, ReadDirectoryChanges on Windows).
 
 ```
-uninorm watch [PATH...] [OPTIONS]
+uninorm watch PATH... [OPTIONS]
 ```
 
 **Arguments**
 
-| Argument | Default | Description |
-|---|---|---|
-| `PATH` | `.` (current directory) | One or more directories to watch (space-separated) |
+| Argument | Description |
+|---|---|
+| `PATH...` | One or more directories to watch — space-separated (required) |
 
 **Options**
 
@@ -97,8 +97,8 @@ uninorm watch [PATH...] [OPTIONS]
 **Examples**
 
 ```bash
-# Watch the current directory
-uninorm watch
+# Watch the current directory (explicit path required)
+uninorm watch .  # current directory
 
 # Watch multiple paths
 uninorm watch ~/Downloads ~/Desktop
