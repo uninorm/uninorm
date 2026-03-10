@@ -19,6 +19,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install X11 libs (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev
+
       - name: Build workspace
         run: cargo build --workspace
 
@@ -34,4 +38,17 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install X11 libs
+        run: sudo apt-get update -q && sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev
       - run: cargo clippy --workspace -- -D warnings
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
