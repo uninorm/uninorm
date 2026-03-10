@@ -27,3 +27,7 @@ rust-project.json
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+# Environment variables
+.envrc
+.env

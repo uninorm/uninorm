@@ -91,7 +91,9 @@ fn watch_state_path() -> Option<PathBuf> {
 }
 
 fn write_watch_state(paths: &[PathBuf]) {
-    let Some(state_path) = watch_state_path() else { return };
+    let Some(state_path) = watch_state_path() else {
+        return;
+    };
     if let Some(parent) = state_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -119,7 +121,11 @@ fn append_log(message: &str) {
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let line = format!("[{ts}] {message}\n");
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
@@ -161,32 +167,11 @@ fn rename_if_needed(path: &Path, exclude: &[String], watch_roots: &[PathBuf]) ->
     // On normalization-insensitive filesystems (APFS) the NFC path resolves to
     // the same inode as the NFD path, so new_path.exists() can be true even
     // when no separate file is there.
-    let is_conflict = new_path.exists() && {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            !std::fs::metadata(path).ok().zip(std::fs::metadata(&new_path).ok())
-                .map(|(m1, m2)| m1.ino() == m2.ino() && m1.dev() == m2.dev())
-                .unwrap_or(false)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            !matches!(
-                (std::fs::metadata(path).ok(), std::fs::metadata(&new_path).ok()),
-                (Some(m1), Some(m2))
-                    if matches!(
-                        (m1.file_index(), m1.volume_serial_number(),
-                         m2.file_index(), m2.volume_serial_number()),
-                        (Some(i1), Some(s1), Some(i2), Some(s2)) if i1 == i2 && s1 == s2
-                    )
-            )
-        }
-        #[cfg(not(any(unix, windows)))]
-        { false }
-    };
+    let is_conflict = new_path.exists() && !uninorm_core::same_inode(path, &new_path);
     if is_conflict {
-        return Some(format!("Conflict: skipping {file_name} (NFC target already exists)"));
+        return Some(format!(
+            "Conflict: skipping {file_name} (NFC target already exists)"
+        ));
     }
 
     // Use a monotonic counter for the temp name — never embed the original
@@ -245,7 +230,7 @@ async fn main() -> Result<()> {
             let pb = ProgressBar::new_spinner();
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .unwrap()
+                    .expect("hardcoded progress template must parse")
                     .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
             );
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
@@ -311,7 +296,7 @@ async fn main() -> Result<()> {
                                             // the two-step rename from re-triggering
                                             // the watcher and causing an infinite loop.
                                             if path.file_name()
-                                                .map_or(false, |n| n.to_string_lossy().starts_with(".uninorm_tmp_"))
+                                                .is_some_and(|n| n.to_string_lossy().starts_with(".uninorm_tmp_"))
                                             {
                                                 continue;
                                             }
@@ -359,7 +344,11 @@ async fn main() -> Result<()> {
             if all.is_empty() {
                 println!("Log is empty.");
             } else {
-                println!("\n({} total entries, showing last {})", all.len(), lines.min(all.len()));
+                println!(
+                    "\n({} total entries, showing last {})",
+                    all.len(),
+                    lines.min(all.len())
+                );
             }
         }
 
@@ -373,10 +362,7 @@ async fn main() -> Result<()> {
                 let raw = std::fs::read_to_string(&state_path)?;
                 let mut lines = raw.lines();
 
-                let pid: u32 = lines
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                let pid: u32 = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                 let started = lines.next().unwrap_or("unknown");
                 let watch_paths: Vec<&str> = lines.collect();
 
@@ -388,7 +374,9 @@ async fn main() -> Result<()> {
                         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
                     }
                     #[cfg(not(unix))]
-                    { false }
+                    {
+                        false
+                    }
                 };
 
                 if alive {

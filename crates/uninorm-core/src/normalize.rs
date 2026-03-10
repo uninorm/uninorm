@@ -195,9 +195,9 @@ mod tests {
 
     #[test]
     fn test_is_nfc_false_for_latin_nfd() {
-        assert!(!is_nfc("e\u{0301}"));    // é in NFD
-        assert!(!is_nfc("n\u{0303}"));    // ñ in NFD
-        assert!(!is_nfc("u\u{0308}"));    // ü in NFD
+        assert!(!is_nfc("e\u{0301}")); // é in NFD
+        assert!(!is_nfc("n\u{0303}")); // ñ in NFD
+        assert!(!is_nfc("u\u{0308}")); // ü in NFD
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn test_is_nfc_true_for_nfc_strings() {
         assert!(is_nfc("hello"));
-        assert!(is_nfc("café"));     // NFC é (U+00E9)
+        assert!(is_nfc("café")); // NFC é (U+00E9)
         assert!(is_nfc("강남구"));
         assert!(is_nfc("が"));
     }

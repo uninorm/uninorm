@@ -1,9 +1,9 @@
-use std::path::Path;
-use walkdir::WalkDir;
+use crate::normalize::{needs_filename_conversion, to_nfc, to_nfc_filename};
 use anyhow::Result;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use crate::normalize::{to_nfc, to_nfc_filename, needs_filename_conversion};
+use std::path::Path;
+use walkdir::WalkDir;
 
 /// Check if two paths refer to the same filesystem inode.
 /// Used to detect the APFS case where NFD and NFC forms of the same name
@@ -31,7 +31,9 @@ pub fn same_inode(p1: &Path, p2: &Path) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub fn same_inode(_p1: &Path, _p2: &Path) -> bool { false }
+pub fn same_inode(_p1: &Path, _p2: &Path) -> bool {
+    false
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -106,7 +108,9 @@ pub async fn convert_path(
             let excluded = relative.components().any(|c| {
                 if let std::path::Component::Normal(name) = c {
                     let s = name.to_string_lossy();
-                    opts.exclude_patterns.iter().any(|pat| s.as_ref() == pat.as_str())
+                    opts.exclude_patterns
+                        .iter()
+                        .any(|pat| s.as_ref() == pat.as_str())
                 } else {
                     false
                 }
@@ -154,16 +158,14 @@ pub async fn convert_path(
                         }
                         Err(e) => {
                             let _ = tokio::fs::rename(&tmp, entry.path()).await; // restore
-                            stats.errors.push(format!(
-                                "Rename failed {}: {e}",
-                                entry.path().display()
-                            ));
+                            stats
+                                .errors
+                                .push(format!("Rename failed {}: {e}", entry.path().display()));
                         }
                     },
-                    Err(e) => stats.errors.push(format!(
-                        "Rename failed {}: {e}",
-                        entry.path().display()
-                    )),
+                    Err(e) => stats
+                        .errors
+                        .push(format!("Rename failed {}: {e}", entry.path().display())),
                 }
             } else {
                 stats.files_renamed += 1; // count in dry-run too
@@ -174,7 +176,11 @@ pub async fn convert_path(
         if opts.convert_content && entry.file_type().is_file() {
             // Use NFC path only if we actually renamed to it; otherwise file is still at entry.path()
             let file_name_nfc = to_nfc_filename(&file_name);
-            let current_path = if opts.convert_filenames && needs_filename_conversion(&file_name) && !opts.dry_run && rename_succeeded {
+            let current_path = if opts.convert_filenames
+                && needs_filename_conversion(&file_name)
+                && !opts.dry_run
+                && rename_succeeded
+            {
                 entry.path().with_file_name(&file_name_nfc)
             } else {
                 entry.path().to_path_buf()
@@ -199,8 +205,8 @@ pub async fn convert_path(
                                 .file_name()
                                 .unwrap_or_default()
                                 .to_string_lossy();
-                            let tmp_path = current_path
-                                .with_file_name(format!("{fname}.uninorm_tmp"));
+                            let tmp_path =
+                                current_path.with_file_name(format!("{fname}.uninorm_tmp"));
                             match tokio::fs::write(&tmp_path, nfc_content.as_bytes()).await {
                                 Ok(_) => match tokio::fs::rename(&tmp_path, &current_path).await {
                                     Ok(_) => stats.files_content_converted += 1,
@@ -335,7 +341,11 @@ mod tests {
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert!(stats.errors.is_empty(), "unexpected errors: {:?}", stats.errors);
+        assert!(
+            stats.errors.is_empty(),
+            "unexpected errors: {:?}",
+            stats.errors
+        );
         assert_eq!(stats.files_renamed, 1);
 
         // The NFC-named file should be readable
@@ -426,7 +436,10 @@ mod tests {
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert!(stats.errors.is_empty(), "binary files must not produce errors");
+        assert!(
+            stats.errors.is_empty(),
+            "binary files must not produce errors"
+        );
         assert_eq!(stats.files_content_converted, 0);
     }
 
@@ -451,7 +464,10 @@ mod tests {
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_content_converted, 1, "only top-level file should be converted");
+        assert_eq!(
+            stats.files_content_converted, 1,
+            "only top-level file should be converted"
+        );
     }
 
     #[tokio::test]
@@ -473,7 +489,10 @@ mod tests {
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_content_converted, 2, "recursive should convert files in subdirs");
+        assert_eq!(
+            stats.files_content_converted, 2,
+            "recursive should convert files in subdirs"
+        );
     }
 
     // ── Empty directory ───────────────────────────────────────────────────────
@@ -507,8 +526,13 @@ mod tests {
         };
 
         let mut calls = 0usize;
-        convert_path(dir.path(), &opts, |_| calls += 1).await.unwrap();
-        assert!(calls >= 3, "expected at least 3 progress calls (2 files + dir), got {calls}");
+        convert_path(dir.path(), &opts, |_| calls += 1)
+            .await
+            .unwrap();
+        assert!(
+            calls >= 3,
+            "expected at least 3 progress calls (2 files + dir), got {calls}"
+        );
     }
 
     // ── files_scanned counts files and directories ────────────────────────────
@@ -530,7 +554,7 @@ mod tests {
     async fn test_combined_filename_and_content_conversion() {
         let dir = TempDir::new().unwrap();
         let nfd_name = format!("cafe\u{0301}.txt"); // filename in NFD
-        let nfd_content = "e\u{0301}";              // content in NFD
+        let nfd_content = "e\u{0301}"; // content in NFD
         fs::write(dir.path().join(&nfd_name), nfd_content).unwrap();
 
         let opts = ConversionOptions {
@@ -598,7 +622,10 @@ mod tests {
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         // Only the file outside node_modules gets renamed.
-        assert_eq!(stats.files_renamed, 1, "only the file outside node_modules should be renamed");
+        assert_eq!(
+            stats.files_renamed, 1,
+            "only the file outside node_modules should be renamed"
+        );
         // The NFD file inside node_modules must not have been touched.
         assert!(
             node.join(&nfd_name).exists(),
@@ -633,7 +660,10 @@ mod tests {
         // Scan starting at `root`, not at `outer`.  The "node_modules" component
         // is above the scan root and must not cause exclusion.
         let stats = convert_path(&root, &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_renamed, 1, "file inside root must be renamed even though root lives inside a node_modules dir");
+        assert_eq!(
+            stats.files_renamed, 1,
+            "file inside root must be renamed even though root lives inside a node_modules dir"
+        );
     }
 
     // ── 100 MB file guard: oversized files are silently skipped for content ───
@@ -659,8 +689,14 @@ mod tests {
             exclude_patterns: Vec::new(),
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_content_converted, 0, "file over 100 MB must be skipped");
-        assert!(stats.errors.is_empty(), "oversized file must not produce an error entry");
+        assert_eq!(
+            stats.files_content_converted, 0,
+            "file over 100 MB must be skipped"
+        );
+        assert!(
+            stats.errors.is_empty(),
+            "oversized file must not produce an error entry"
+        );
     }
 
     // ── 100 MB boundary: file exactly at the limit is processed ──────────────
@@ -686,7 +722,10 @@ mod tests {
             exclude_patterns: Vec::new(),
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_content_converted, 1, "small file must not be skipped by the size guard");
+        assert_eq!(
+            stats.files_content_converted, 1,
+            "small file must not be skipped by the size guard"
+        );
     }
 
     // ── rename_succeeded flag: content uses the original path when rename fails
@@ -773,7 +812,10 @@ mod tests {
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
         // Both the directory and the file inside it must be renamed (2 renames).
-        assert_eq!(stats.files_renamed, 2, "expected directory + child file both renamed");
+        assert_eq!(
+            stats.files_renamed, 2,
+            "expected directory + child file both renamed"
+        );
         // The NFC-named path must now be accessible.
         let nfc_dir = dir.path().join("caf\u{00E9}");
         assert!(nfc_dir.exists(), "NFC directory must exist after rename");
@@ -811,7 +853,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().starts_with(".uninorm_tmp_"))
             .collect();
-        assert!(stale.is_empty(), "temp files must be cleaned up: {:?}", stale);
+        assert!(
+            stale.is_empty(),
+            "temp files must be cleaned up: {:?}",
+            stale
+        );
     }
 
     // ── Atomic write: no temp file left after successful content conversion ────
@@ -834,7 +880,10 @@ mod tests {
 
         // The temp file used during atomic write is "{original}.uninorm_tmp".
         let tmp = dir.path().join("test.txt.uninorm_tmp");
-        assert!(!tmp.exists(), "atomic temp file must be removed after successful write");
+        assert!(
+            !tmp.exists(),
+            "atomic temp file must be removed after successful write"
+        );
     }
 
     // ── Rename conflict: NFC target already exists as a different file ─────────
@@ -877,10 +926,16 @@ mod tests {
 
         if same {
             // APFS: normalization-insensitive — treated as same file, rename succeeds.
-            assert!(stats.errors.is_empty(), "APFS same-inode rename must not be an error");
+            assert!(
+                stats.errors.is_empty(),
+                "APFS same-inode rename must not be an error"
+            );
         } else {
             // Case-sensitive FS: distinct inodes → conflict must be logged.
-            assert_eq!(stats.files_renamed, 0, "conflicting rename must not proceed");
+            assert_eq!(
+                stats.files_renamed, 0,
+                "conflicting rename must not proceed"
+            );
             assert!(
                 stats.errors.iter().any(|e| e.contains("Rename conflict")),
                 "expected a Rename conflict error, got: {:?}",
@@ -1074,10 +1129,19 @@ mod tests {
             exclude_patterns: Vec::new(),
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        assert_eq!(stats.files_renamed, 1, "dry-run should count filename changes");
-        assert_eq!(stats.files_content_converted, 1, "dry-run should count content changes");
+        assert_eq!(
+            stats.files_renamed, 1,
+            "dry-run should count filename changes"
+        );
+        assert_eq!(
+            stats.files_content_converted, 1,
+            "dry-run should count content changes"
+        );
         // Original NFD file must still exist and be unchanged.
-        assert!(nfd_path.exists(), "original NFD file must not be renamed in dry-run");
+        assert!(
+            nfd_path.exists(),
+            "original NFD file must not be renamed in dry-run"
+        );
         assert_eq!(
             fs::read_to_string(&nfd_path).unwrap(),
             nfd_content,
