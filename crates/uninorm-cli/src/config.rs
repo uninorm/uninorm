@@ -313,6 +313,7 @@ mod tests {
         assert!(parsed.entries[0].recursive);
         assert!(!parsed.entries[0].content);
         assert_eq!(parsed.entries[0].exclude, vec![".git"]);
+        assert!(parsed.entries[0].enabled);
     }
 
     #[test]
@@ -324,6 +325,7 @@ mod tests {
         assert!(!cfg.entries[0].content);
         assert!(!cfg.entries[0].follow_symlinks);
         assert!(cfg.entries[0].exclude.is_empty());
+        assert!(cfg.entries[0].enabled);
     }
 
     #[test]
@@ -393,5 +395,74 @@ mod tests {
             .entries
             .iter()
             .all(|e| e.path.as_path() != Path::new("/tmp/path_2")));
+    }
+
+    #[test]
+    fn test_enable_disable_toggle() {
+        let mut cfg = WatchConfig::default();
+        cfg.add_entry(WatchEntry {
+            path: "/tmp/toggle".into(),
+            recursive: true,
+            content: false,
+            follow_symlinks: false,
+            exclude: vec![],
+            max_content_bytes: None,
+            enabled: true,
+        });
+        assert!(cfg.entries[0].enabled);
+
+        cfg.entries[0].enabled = false;
+        assert!(!cfg.entries[0].enabled);
+
+        cfg.entries[0].enabled = true;
+        assert!(cfg.entries[0].enabled);
+    }
+
+    #[test]
+    fn test_serde_enabled_roundtrip() {
+        let mut cfg = WatchConfig::default();
+        cfg.add_entry(WatchEntry {
+            path: "/tmp/a".into(),
+            recursive: true,
+            content: false,
+            follow_symlinks: false,
+            exclude: vec![],
+            max_content_bytes: None,
+            enabled: true,
+        });
+        cfg.add_entry(WatchEntry {
+            path: "/tmp/b".into(),
+            recursive: true,
+            content: false,
+            follow_symlinks: false,
+            exclude: vec![],
+            max_content_bytes: None,
+            enabled: false,
+        });
+
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        let parsed: WatchConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.entries[0].enabled);
+        assert!(!parsed.entries[1].enabled);
+    }
+
+    #[test]
+    fn test_serde_enabled_defaults_to_true() {
+        // Old config without "enabled" field should default to true
+        let json = r#"{"entries": [{"path": "/tmp/old"}]}"#;
+        let cfg: WatchConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.entries[0].enabled);
+    }
+
+    #[test]
+    fn test_debounce_ms_serde() {
+        let json = r#"{"entries": [], "debounce_ms": 500}"#;
+        let cfg: WatchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.debounce_ms, Some(500));
+
+        let json2 = r#"{"entries": []}"#;
+        let cfg2: WatchConfig = serde_json::from_str(json2).unwrap();
+        assert_eq!(cfg2.debounce_ms, None);
     }
 }
