@@ -74,13 +74,9 @@ pub fn same_inode(p1: &Path, p2: &Path) -> bool {
 
 #[cfg(windows)]
 pub fn same_inode(p1: &Path, p2: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    match (std::fs::metadata(p1), std::fs::metadata(p2)) {
-        (Ok(m1), Ok(m2)) => matches!(
-            (m1.file_index(), m1.volume_serial_number(),
-             m2.file_index(), m2.volume_serial_number()),
-            (Some(i1), Some(s1), Some(i2), Some(s2)) if i1 == i2 && s1 == s2
-        ),
+    // NTFS doesn't have NFD/NFC aliasing like APFS, so canonical path comparison suffices.
+    match (std::fs::canonicalize(p1), std::fs::canonicalize(p2)) {
+        (Ok(c1), Ok(c2)) => c1 == c2,
         _ => false,
     }
 }
