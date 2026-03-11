@@ -150,7 +150,15 @@ fn rename_if_needed(path: &Path, ce: &CompiledEntry<'_>) -> (Option<String>, Opt
                 Some(new_path),
             ),
             Err(e) => {
-                let _ = std::fs::rename(&tmp, path);
+                if let Err(rb_err) = std::fs::rename(&tmp, path) {
+                    return (
+                        Some(format!(
+                            "Error: rename failed for {file_name}: {e}; rollback also failed: {rb_err} (orphaned temp: {})",
+                            tmp.display()
+                        )),
+                        None,
+                    );
+                }
                 (
                     Some(format!("Error: rename failed for {file_name}: {e}")),
                     None,
@@ -256,7 +264,13 @@ async fn run_daemon_platform() -> Result<()> {
             .filter(|e| e.enabled)
             .map(|e| CompiledEntry {
                 entry: e,
-                globs: uninorm_core::compile_excludes(&e.exclude),
+                globs: {
+                    let (set, invalid) = uninorm_core::compile_excludes(&e.exclude);
+                    for pat in &invalid {
+                        append_log(&format!("Warning: invalid exclude pattern ignored: {pat}"));
+                    }
+                    set
+                },
             })
             .collect();
 

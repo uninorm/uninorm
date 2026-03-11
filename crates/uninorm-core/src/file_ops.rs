@@ -23,16 +23,24 @@ pub fn temp_name() -> String {
 
 /// Compile exclude patterns into a `GlobSet` for efficient matching.
 /// Supports both exact names (e.g. `.git`) and glob patterns (e.g. `*.log`, `build*`).
-pub fn compile_excludes(patterns: &[String]) -> GlobSet {
+/// Returns `(GlobSet, Vec<String>)` where the second element contains any invalid patterns.
+pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
     let mut builder = GlobSetBuilder::new();
+    let mut invalid = Vec::new();
     for pat in patterns {
-        if let Ok(glob) = Glob::new(pat) {
-            builder.add(glob);
+        match Glob::new(pat) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            Err(_) => {
+                invalid.push(pat.clone());
+            }
         }
     }
-    builder
+    let set = builder
         .build()
-        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+    (set, invalid)
 }
 
 /// Check if a path should be excluded based on compiled glob patterns.
@@ -145,7 +153,12 @@ pub async fn convert_path(
     mut progress: impl FnMut(&ConversionStats),
 ) -> Result<ConversionStats> {
     let mut stats = ConversionStats::default();
-    let globs = compile_excludes(&opts.exclude_patterns);
+    let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
+    for pat in &invalid_patterns {
+        stats
+            .errors
+            .push(format!("Warning: invalid exclude pattern ignored: {pat}"));
+    }
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
 
     let walker = WalkDir::new(path)
@@ -206,10 +219,17 @@ pub async fn convert_path(
                             rename_succeeded = true;
                         }
                         Err(e) => {
-                            let _ = tokio::fs::rename(&tmp, &ce.path).await;
-                            stats
-                                .errors
-                                .push(format!("Rename failed {}: {e}", ce.path.display()));
+                            if let Err(rb_err) = tokio::fs::rename(&tmp, &ce.path).await {
+                                stats.errors.push(format!(
+                                    "Rename failed {}: {e}; rollback also failed: {rb_err} (orphaned temp: {})",
+                                    ce.path.display(),
+                                    tmp.display()
+                                ));
+                            } else {
+                                stats
+                                    .errors
+                                    .push(format!("Rename failed {}: {e}", ce.path.display()));
+                            }
                         }
                     },
                     Err(e) => stats
@@ -348,7 +368,7 @@ impl ScanResult {
 /// conversion, without modifying anything. Content reads are parallelized.
 pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
     let mut result = ScanResult::default();
-    let globs = compile_excludes(&opts.exclude_patterns);
+    let (globs, _invalid_patterns) = compile_excludes(&opts.exclude_patterns);
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
     let walker = WalkDir::new(path)
         .follow_links(opts.follow_symlinks)

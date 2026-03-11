@@ -207,7 +207,11 @@ fn parse_size(s: &str) -> std::result::Result<u64, String> {
     if !num.is_finite() || num <= 0.0 {
         return Err(format!("Invalid size: {s}"));
     }
-    Ok((num * multiplier as f64) as u64)
+    let result = num * multiplier as f64;
+    if result > u64::MAX as f64 {
+        return Err(format!("Size too large: {s}"));
+    }
+    Ok(result as u64)
 }
 
 fn make_spinner() -> ProgressBar {
