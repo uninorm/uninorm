@@ -1,12 +1,13 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use uninorm_cli::config;
+use uninorm_cli::daemon;
+
+use std::io::Write;
+use std::path::PathBuf;
 
 use anyhow::Result;
-
-static WATCH_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use uninorm_core::{ConversionOptions, ConversionStats};
+use uninorm_core::{ConversionOptions, ConversionStats, DEFAULT_MAX_CONTENT_BYTES};
 
 #[derive(Parser)]
 #[command(
@@ -30,9 +31,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Recurse into subdirectories (default: true)
-        #[arg(short = 'r', long, default_value = "true")]
-        recursive: bool,
+        /// Do not recurse into subdirectories
+        #[arg(long)]
+        no_recursive: bool,
 
         /// Also convert text content inside files
         #[arg(long)]
@@ -42,20 +43,27 @@ enum Commands {
         #[arg(long)]
         follow_symlinks: bool,
 
-        /// Exclude entries whose name matches this pattern (repeatable: --exclude .git --exclude node_modules)
+        /// Exclude entries matching NAME or glob pattern (repeatable: --exclude .git --exclude "*.log")
         #[arg(long, value_name = "PATTERN")]
         exclude: Vec<String>,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Show individual file changes
+        #[arg(short = 'v', long)]
+        verbose: bool,
+
+        /// Maximum file size for content conversion (e.g. 50MB, 1GB). Default: 100MB
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        max_size: Option<u64>,
     },
 
-    /// Watch paths and automatically convert NFD filenames as files appear or are renamed
+    /// Manage background file watching (add/remove/start/stop watch entries)
     Watch {
-        /// One or more paths to watch
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-
-        /// Exclude entries whose name matches this pattern (repeatable)
-        #[arg(long, value_name = "PATTERN")]
-        exclude: Vec<String>,
+        #[command(subcommand)]
+        action: WatchAction,
     },
 
     /// Show recent conversion log
@@ -65,7 +73,7 @@ enum Commands {
         lines: usize,
     },
 
-    /// Show watcher status (running paths, PID, recent activity)
+    /// Show watcher status (daemon PID, watched paths, recent activity)
     Status,
 
     /// Convert clipboard text from NFD to NFC and write it back
@@ -76,165 +84,273 @@ enum Commands {
         /// Text to check
         text: String,
     },
+
+    /// Internal: run as background daemon
+    #[command(hide = true)]
+    Daemon,
 }
 
-// ── Log helpers ───────────────────────────────────────────────────────────────
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Add or update a watch entry
+    Add {
+        /// Path to watch
+        path: PathBuf,
 
-fn log_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("uninorm").join("uninorm.log"))
+        /// Do not recurse into subdirectories
+        #[arg(long)]
+        no_recursive: bool,
+
+        /// Also convert text content inside files on change
+        #[arg(long)]
+        content: bool,
+
+        /// Follow symbolic links
+        #[arg(long)]
+        follow_symlinks: bool,
+
+        /// Exclude entries matching NAME or glob pattern (repeatable)
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+
+        /// Maximum file size for content conversion (e.g. 50MB, 1GB). Default: 100MB
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        max_size: Option<u64>,
+
+        /// Event debounce interval in milliseconds (default: 300)
+        #[arg(long, value_name = "MS")]
+        debounce: Option<u64>,
+    },
+
+    /// Remove watch entries by number (comma-separated, e.g. 1,3,5)
+    Remove {
+        /// Entry numbers to remove (comma-separated)
+        indices: String,
+    },
+
+    /// Show all watch entries
+    List,
+
+    /// Enable watch entries by number (comma-separated, e.g. 1,3,5)
+    Enable {
+        /// Entry numbers to enable (comma-separated)
+        indices: String,
+    },
+
+    /// Disable watch entries (comma-separated, e.g. 1,3,5)
+    Disable {
+        /// Entry numbers to disable (comma-separated)
+        indices: String,
+    },
+
+    /// Start the background daemon
+    Start,
+
+    /// Stop the background daemon
+    Stop,
+
+    /// Remove all watch entries and stop daemon
+    Reset {
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
-// ── Watch state helpers ────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn watch_state_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("uninorm").join("watch.state"))
+/// Parse comma-separated 1-based indices (e.g. "1,3,5") and validate against entry count.
+/// Returns sorted, deduplicated 0-based indices.
+fn parse_indices(s: &str, count: usize) -> Result<Vec<usize>> {
+    let mut indices = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let n: usize = part
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid number: {part}"))?;
+        if n == 0 || n > count {
+            anyhow::bail!(
+                "Entry #{n} does not exist. Use `uninorm watch list` to see entries (1-{count})."
+            );
+        }
+        indices.push(n - 1); // convert to 0-based
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        anyhow::bail!("No entry numbers provided.");
+    }
+    Ok(indices)
 }
 
-fn write_watch_state(paths: &[PathBuf]) {
-    let Some(state_path) = watch_state_path() else {
-        return;
+/// Parse human-readable size strings like "100MB", "1GB", "500KB", or raw bytes.
+fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim().to_uppercase();
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GB") {
+        (n, 1024 * 1024 * 1024u64)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n, 1024)
+    } else if let Some(n) = s.strip_suffix('B') {
+        (n, 1)
+    } else {
+        (s.as_str(), 1)
     };
-    if let Some(parent) = state_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let num: f64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("Invalid size: {s}"))?;
+    if !num.is_finite() || num <= 0.0 {
+        return Err(format!("Invalid size: {s}"));
     }
-    let pid = std::process::id();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let mut content = format!("{pid}\n{ts}\n");
-    for p in paths {
-        let canonical = p.canonicalize().unwrap_or_else(|_| p.clone());
-        content.push_str(&format!("{}\n", canonical.display()));
-    }
-    let _ = std::fs::write(&state_path, content);
+    Ok((num * multiplier as f64) as u64)
 }
 
-fn clear_watch_state() {
-    if let Some(state_path) = watch_state_path() {
-        let _ = std::fs::remove_file(state_path);
-    }
+fn make_spinner() -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .expect("hardcoded progress template must parse")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
 }
 
-fn append_log(message: &str) {
-    let Some(path) = log_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn confirm(prompt: &str) -> bool {
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
     }
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let line = format!("[{ts}] {message}\n");
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-// ── Watch helper: rename a single path if it needs NFD→NFC conversion ────────
+fn print_stats(stats: &ConversionStats, dry_run: bool) {
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+    println!("{prefix}Scanned:  {}", stats.files_scanned);
+    println!("{prefix}Renamed:  {}", stats.files_renamed);
+    println!("{prefix}Content:  {}", stats.files_content_converted);
 
-fn rename_if_needed(path: &Path, exclude: &[String], watch_roots: &[PathBuf]) -> Option<String> {
-    let file_name = path.file_name()?.to_string_lossy();
-
-    // Check exclude patterns against the path relative to the watch root only,
-    // so that patterns like "node_modules" don't accidentally match a parent
-    // directory that happens to share the name (e.g. /home/node_modules/project/).
-    if !exclude.is_empty() {
-        let relative = watch_roots
-            .iter()
-            .find_map(|root| path.strip_prefix(root).ok())
-            .unwrap_or(path);
-        if relative.components().any(|c| {
-            if let std::path::Component::Normal(n) = c {
-                let s = n.to_string_lossy();
-                exclude.iter().any(|pat| s.as_ref() == pat.as_str())
-            } else {
-                false
-            }
-        }) {
-            return None;
+    if !stats.errors.is_empty() {
+        eprintln!("\nErrors ({}):", stats.errors.len());
+        for e in &stats.errors {
+            eprintln!("  - {e}");
         }
     }
+}
 
-    if !uninorm_core::needs_filename_conversion(&file_name) {
-        return None;
-    }
-
-    let nfc_name = uninorm_core::to_nfc_filename(&file_name);
-    let new_path = path.with_file_name(&nfc_name);
-    let parent = path.parent()?;
-
-    // Check for a genuine conflict: NFC target exists AND is a different file.
-    // On normalization-insensitive filesystems (APFS) the NFC path resolves to
-    // the same inode as the NFD path, so new_path.exists() can be true even
-    // when no separate file is there.
-    let is_conflict = new_path.exists() && !uninorm_core::same_inode(path, &new_path);
-    if is_conflict {
-        return Some(format!(
-            "Conflict: skipping {file_name} (NFC target already exists)"
-        ));
-    }
-
-    // Use a monotonic counter for the temp name — never embed the original
-    // (potentially NFD) filename, which would cause the watcher to pick up
-    // the temp file and attempt another rename, triggering an infinite loop.
-    let count = WATCH_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".uninorm_tmp_{count}"));
-
-    match std::fs::rename(path, &tmp) {
-        Ok(_) => match std::fs::rename(&tmp, &new_path) {
-            Ok(_) => Some(format!("Renamed: {} → {}", file_name, nfc_name)),
-            Err(e) => {
-                let _ = std::fs::rename(&tmp, path);
-                Some(format!("Error: rename failed for {file_name}: {e}"))
-            }
-        },
-        Err(e) => Some(format!("Error: rename failed for {file_name}: {e}")),
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{}MB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{bytes}B")
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Entry point ──────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // ── files: batch convert ─────────────────────────────────────
         Commands::Files {
             path,
             dry_run,
-            recursive,
+            no_recursive,
             content,
             follow_symlinks,
             exclude,
+            yes,
+            verbose,
+            max_size,
         } => {
             if !path.exists() {
                 anyhow::bail!("Path does not exist: {}", path.display());
-            }
-
-            if dry_run {
-                println!("[dry-run] No files will be modified.");
-            }
-            if !exclude.is_empty() {
-                println!("Excluding: {}", exclude.join(", "));
             }
 
             let opts = ConversionOptions {
                 convert_filenames: true,
                 convert_content: content,
                 dry_run,
-                recursive,
+                recursive: !no_recursive,
                 follow_symlinks,
                 exclude_patterns: exclude,
+                max_content_bytes: max_size.unwrap_or(DEFAULT_MAX_CONTENT_BYTES),
             };
 
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template("{spinner:.cyan} {msg}")
-                    .expect("hardcoded progress template must parse")
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-            );
-            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            // Pre-scan
+            let scan_pb = make_spinner();
+            scan_pb.set_message("Scanning...");
+            let scan = uninorm_core::scan_path(&path, &opts).await;
+            scan_pb.finish_and_clear();
 
+            println!(
+                "Scanned {} entries under {}",
+                scan.total_scanned,
+                path.display()
+            );
+
+            if !scan.errors.is_empty() {
+                eprintln!("Scan errors ({}):", scan.errors.len());
+                for e in &scan.errors {
+                    eprintln!("  - {e}");
+                }
+            }
+
+            if scan.affected_count() == 0 {
+                println!("No NFD entries found — nothing to do.");
+                return Ok(());
+            }
+
+            let rename_count = scan.rename_count();
+            let content_count = scan.content_count();
+
+            if rename_count > 0 {
+                println!("  Filenames to rename:  {rename_count}");
+            }
+            if content_count > 0 {
+                println!("  Files with NFD content: {content_count}");
+            }
+
+            if verbose {
+                println!();
+                for entry in &scan.entries {
+                    if entry.needs_rename {
+                        let old = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                        let new = entry.new_name.as_deref().unwrap_or("?");
+                        println!("  rename: {} → {}", old, new);
+                    }
+                    if entry.needs_content_conversion {
+                        println!("  content: {}", entry.path.display());
+                    }
+                }
+            }
+
+            if !dry_run && !yes {
+                println!();
+                if !confirm("Proceed with conversion?") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            if dry_run {
+                println!("\n[dry-run] No files will be modified.");
+            }
+
+            let pb = make_spinner();
             let stats = uninorm_core::convert_path(&path, &opts, |s: &ConversionStats| {
                 pb.set_message(format!(
                     "Scanned: {}  Renamed: {}  Content: {}",
@@ -250,93 +366,249 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Watch { paths, exclude } => {
-            use notify::Watcher;
-            use tokio::sync::mpsc;
-
-            let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
-
-            let mut watcher = notify::RecommendedWatcher::new(
-                move |res| {
-                    let _ = tx.send(res);
-                },
-                notify::Config::default(),
-            )?;
-
-            for path in &paths {
+        // ── watch: manage watch entries and daemon ─────────────────
+        Commands::Watch { action } => match action {
+            WatchAction::Add {
+                path,
+                no_recursive,
+                content,
+                follow_symlinks,
+                exclude,
+                max_size,
+                debounce,
+            } => {
                 if !path.exists() {
                     anyhow::bail!("Path does not exist: {}", path.display());
                 }
-                watcher.watch(path.as_path(), notify::RecursiveMode::Recursive)?;
-                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-                let msg = format!("Watching: {}", canonical.display());
-                println!("{msg}");
-                append_log(&msg);
+                let canonical = path.canonicalize()?;
+
+                let mut cfg = config::WatchConfig::load()?;
+
+                if let Some(ms) = debounce {
+                    cfg.debounce_ms = Some(ms);
+                }
+
+                let is_new = cfg.add_entry(config::WatchEntry {
+                    path: canonical.clone(),
+                    recursive: !no_recursive,
+                    content,
+                    follow_symlinks,
+                    exclude,
+                    max_content_bytes: max_size,
+                    enabled: true,
+                });
+                cfg.save()?;
+
+                if is_new {
+                    println!("Added: {}", canonical.display());
+                } else {
+                    println!("Updated: {}", canonical.display());
+                }
+
+                #[cfg(unix)]
+                if config::is_daemon_running() {
+                    config::signal_daemon(libc::SIGHUP);
+                    println!("Daemon notified to reload config.");
+                }
             }
 
-            write_watch_state(&paths);
+            WatchAction::Remove { indices } => {
+                let mut cfg = config::WatchConfig::load()?;
+                let to_remove = parse_indices(&indices, cfg.entries.len())?;
 
-            if !exclude.is_empty() {
-                println!("Excluding: {}", exclude.join(", "));
-            }
-            println!("Press Ctrl+C to stop.\n");
+                // Remove in reverse order to keep indices valid
+                for &idx in to_remove.iter().rev() {
+                    let removed = cfg.entries.remove(idx);
+                    println!("Removed #{}: {}", idx + 1, removed.path.display());
+                }
+                cfg.save()?;
 
-            loop {
-                tokio::select! {
-                    Some(result) = rx.recv() => {
-                        match result {
-                            Ok(event) => {
-                                use notify::EventKind;
-                                match event.kind {
-                                    EventKind::Create(_)
-                                    | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                                    | EventKind::Any => {
-                                        for path in &event.paths {
-                                            // Skip our own temp files to prevent
-                                            // the two-step rename from re-triggering
-                                            // the watcher and causing an infinite loop.
-                                            if path.file_name()
-                                                .is_some_and(|n| n.to_string_lossy().starts_with(".uninorm_tmp_"))
-                                            {
-                                                continue;
-                                            }
-                                            if path.exists() {
-                                                if let Some(msg) = rename_if_needed(path, &exclude, &paths) {
-                                                    println!("{msg}");
-                                                    append_log(&msg);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Err(e) => eprintln!("Watch error: {e}"),
-                        }
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        let msg = "Watch stopped.";
-                        println!("\n{msg}");
-                        append_log(msg);
-                        clear_watch_state();
-                        break;
+                #[cfg(unix)]
+                if config::is_daemon_running() {
+                    if cfg.entries.iter().any(|e| e.enabled) {
+                        config::signal_daemon(libc::SIGHUP);
+                        println!("Daemon notified to reload config.");
+                    } else {
+                        config::signal_daemon(libc::SIGTERM);
+                        println!("Daemon stopped (no enabled entries).");
                     }
                 }
             }
-        }
 
+            WatchAction::List => {
+                let cfg = config::WatchConfig::load()?;
+
+                if cfg.entries.is_empty() {
+                    println!("No watch entries. Add one with: uninorm watch add <path>");
+                    return Ok(());
+                }
+
+                if let Some(ms) = cfg.debounce_ms {
+                    println!("Debounce: {ms}ms");
+                }
+
+                println!();
+                for (i, entry) in cfg.entries.iter().enumerate() {
+                    let status = if entry.enabled { "enabled" } else { "disabled" };
+                    let mut flags = Vec::new();
+                    if !entry.recursive {
+                        flags.push("non-recursive".to_string());
+                    }
+                    if entry.content {
+                        flags.push("content".to_string());
+                    }
+                    if entry.follow_symlinks {
+                        flags.push("follow-symlinks".to_string());
+                    }
+                    if !entry.exclude.is_empty() {
+                        flags.push(format!("excludes: {}", entry.exclude.join(", ")));
+                    }
+                    if let Some(max) = entry.max_content_bytes {
+                        flags.push(format!("max-size: {}", format_size(max)));
+                    }
+                    let opts = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ({})", flags.join(", "))
+                    };
+                    println!("  {}. {}  [{status}]{opts}", i + 1, entry.path.display());
+                }
+            }
+
+            WatchAction::Enable { indices } => {
+                let mut cfg = config::WatchConfig::load()?;
+                let to_enable = parse_indices(&indices, cfg.entries.len())?;
+
+                for &idx in &to_enable {
+                    cfg.entries[idx].enabled = true;
+                    println!("Enabled #{}: {}", idx + 1, cfg.entries[idx].path.display());
+                }
+                cfg.save()?;
+
+                #[cfg(unix)]
+                if config::is_daemon_running() {
+                    config::signal_daemon(libc::SIGHUP);
+                    println!("Daemon notified to reload config.");
+                }
+            }
+
+            WatchAction::Disable { indices } => {
+                let mut cfg = config::WatchConfig::load()?;
+                let to_disable = parse_indices(&indices, cfg.entries.len())?;
+
+                for &idx in &to_disable {
+                    cfg.entries[idx].enabled = false;
+                    println!("Disabled #{}: {}", idx + 1, cfg.entries[idx].path.display());
+                }
+                cfg.save()?;
+
+                #[cfg(unix)]
+                if config::is_daemon_running() {
+                    config::signal_daemon(libc::SIGHUP);
+                    println!("Daemon notified to reload config.");
+                }
+            }
+
+            WatchAction::Start => {
+                let cfg = config::WatchConfig::load()?;
+                let enabled_count = cfg.entries.iter().filter(|e| e.enabled).count();
+
+                if enabled_count == 0 {
+                    println!("No enabled watch entries.");
+                    println!("Add one with: uninorm watch add <path>");
+                    return Ok(());
+                }
+
+                #[cfg(unix)]
+                {
+                    if config::is_daemon_running() {
+                        println!(
+                            "Daemon already running (PID {}).",
+                            config::read_pid().unwrap_or(0)
+                        );
+                    } else {
+                        daemon::spawn_daemon()?;
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        if config::is_daemon_running() {
+                            println!("Daemon started (PID {}).", config::read_pid().unwrap_or(0));
+                            println!("\nWatching ({enabled_count} entries):");
+                            for entry in cfg.entries.iter().filter(|e| e.enabled) {
+                                println!("  {}", entry.path.display());
+                            }
+                        } else {
+                            eprintln!(
+                                "Warning: daemon may not have started. Check `uninorm status`."
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    eprintln!("Background daemon is not supported on this platform.");
+                    eprintln!("Use `uninorm files` for manual conversion.");
+                }
+            }
+
+            WatchAction::Stop => {
+                #[cfg(unix)]
+                {
+                    if config::is_daemon_running() {
+                        config::signal_daemon(libc::SIGTERM);
+                        println!("Daemon stopped.");
+                    } else {
+                        println!("Daemon is not running.");
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    println!("Background daemon is not supported on this platform.");
+                }
+            }
+
+            WatchAction::Reset { yes } => {
+                let cfg = config::WatchConfig::load()?;
+                if cfg.entries.is_empty() {
+                    println!("No watch entries to remove.");
+                    return Ok(());
+                }
+
+                if !yes {
+                    print!("Remove all {} watch entries? [y/N] ", cfg.entries.len());
+                    std::io::stdout().flush()?;
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    if !input.trim().eq_ignore_ascii_case("y") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+
+                let path = config::config_path()?;
+                std::fs::remove_file(&path)?;
+                println!("All watch entries removed.");
+
+                #[cfg(unix)]
+                if config::is_daemon_running() {
+                    config::signal_daemon(libc::SIGTERM);
+                    println!("Daemon stopped.");
+                }
+            }
+        },
+
+        // ── log: show recent entries ─────────────────────────────────
         Commands::Log { lines } => {
-            let path = log_path()
-                .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
+            let path = config::log_path()?;
 
             if !path.exists() {
-                println!("No log file yet. Run `uninorm watch` to start logging.");
+                println!("No log file yet. Run `uninorm watch <path>` to start.");
                 println!("Log location: {}", path.display());
                 return Ok(());
             }
 
-            let content = std::fs::read_to_string(&path)?;
-            let all: Vec<&str> = content.lines().collect();
+            use std::io::BufRead;
+            let file = std::fs::File::open(&path)?;
+            let reader = std::io::BufReader::new(file);
+            let all: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
             let start = all.len().saturating_sub(lines);
             for line in &all[start..] {
                 println!("{line}");
@@ -352,59 +624,40 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── status: show daemon status + summary ─────────────────────
         Commands::Status => {
-            let state_path = watch_state_path()
-                .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?;
-
-            if !state_path.exists() {
-                println!("No watcher is running.");
-            } else {
-                let raw = std::fs::read_to_string(&state_path)?;
-                let mut lines = raw.lines();
-
-                let pid: u32 = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                let started = lines.next().unwrap_or("unknown");
-                let watch_paths: Vec<&str> = lines.collect();
-
-                // Check whether the PID is still alive.
-                let alive = pid > 0 && {
-                    #[cfg(unix)]
-                    {
-                        // kill(pid, 0) returns Ok if process exists.
-                        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        false
-                    }
-                };
-
-                if alive {
-                    println!("Watcher running  (PID {pid}, started {started})");
+            let running = config::is_daemon_running();
+            if let Some(pid) = config::read_pid() {
+                if running {
+                    println!("Daemon running (PID {pid})");
                 } else {
-                    println!("Watcher not running  (last PID {pid}, started {started})");
-                    // Clean up stale state file.
-                    let _ = std::fs::remove_file(&state_path);
+                    println!("Daemon not running (stale PID {pid})");
+                    config::remove_pid();
                 }
+            } else {
+                println!("Daemon not running.");
+            }
 
-                if !watch_paths.is_empty() {
-                    println!("\nWatched paths:");
-                    for p in &watch_paths {
-                        println!("  {p}");
-                    }
-                }
+            let cfg = config::WatchConfig::load()?;
+            let total = cfg.entries.len();
+            let enabled = cfg.entries.iter().filter(|e| e.enabled).count();
+            if total > 0 {
+                println!("Watch entries: {enabled}/{total} enabled");
+                println!("Use `uninorm watch list` for details.");
+            } else {
+                println!("No watch entries configured.");
+            }
 
-                // Show last 5 log lines.
-                if let Some(log) = log_path() {
-                    if log.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&log) {
-                            let all: Vec<&str> = content.lines().collect();
-                            let recent = &all[all.len().saturating_sub(5)..];
-                            if !recent.is_empty() {
-                                println!("\nRecent activity:");
-                                for l in recent {
-                                    println!("  {l}");
-                                }
+            // Show last 5 log lines
+            if let Ok(log) = config::log_path() {
+                if log.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&log) {
+                        let all: Vec<&str> = content.lines().collect();
+                        let recent = &all[all.len().saturating_sub(5)..];
+                        if !recent.is_empty() {
+                            println!("\nRecent activity:");
+                            for l in recent {
+                                println!("  {l}");
                             }
                         }
                     }
@@ -412,6 +665,7 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── clipboard ────────────────────────────────────────────────
         Commands::Clipboard => {
             let mut clipboard = arboard::Clipboard::new()
                 .map_err(|e| anyhow::anyhow!("Failed to open clipboard: {e}"))?;
@@ -432,6 +686,7 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── check ────────────────────────────────────────────────────
         Commands::Check { text } => {
             if uninorm_core::is_nfc(&text) {
                 println!("✓ Already NFC");
@@ -441,21 +696,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+
+        // ── daemon (hidden, internal) ────────────────────────────────
+        Commands::Daemon => {
+            daemon::run_daemon().await?;
+        }
     }
 
     Ok(())
-}
-
-fn print_stats(stats: &ConversionStats, dry_run: bool) {
-    let prefix = if dry_run { "[dry-run] " } else { "" };
-    println!("{prefix}Scanned:  {}", stats.files_scanned);
-    println!("{prefix}Renamed:  {}", stats.files_renamed);
-    println!("{prefix}Content:  {}", stats.files_content_converted);
-
-    if !stats.errors.is_empty() {
-        eprintln!("\nErrors ({}):", stats.errors.len());
-        for e in &stats.errors {
-            eprintln!("  - {e}");
-        }
-    }
 }

@@ -1,9 +1,56 @@
 use crate::normalize::{needs_filename_conversion, to_nfc, to_nfc_filename};
 use anyhow::Result;
+use futures::stream::{self, StreamExt};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
+
+/// Default maximum file size for content conversion (100 MB).
+pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Global atomic counter for unique temp file names.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a unique temp file name that won't collide across processes or restarts.
+pub fn temp_name() -> String {
+    let pid = std::process::id();
+    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".uninorm_tmp_{pid}_{count}")
+}
+
+/// Compile exclude patterns into a `GlobSet` for efficient matching.
+/// Supports both exact names (e.g. `.git`) and glob patterns (e.g. `*.log`, `build*`).
+pub fn compile_excludes(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        if let Ok(glob) = Glob::new(pat) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap())
+}
+
+/// Check if a path should be excluded based on compiled glob patterns.
+/// Matches against each component of the relative path (from root).
+pub fn is_excluded(entry_path: &Path, root: &Path, globs: &GlobSet) -> bool {
+    if globs.is_empty() {
+        return false;
+    }
+    let relative = entry_path.strip_prefix(root).unwrap_or(entry_path);
+    relative.components().any(|c| {
+        if let std::path::Component::Normal(name) = c {
+            let s = name.to_string_lossy();
+            globs.is_match(s.as_ref())
+        } else {
+            false
+        }
+    })
+}
 
 /// Check if two paths refer to the same filesystem inode.
 /// Used to detect the APFS case where NFD and NFC forms of the same name
@@ -44,9 +91,19 @@ pub struct ConversionOptions {
     pub recursive: bool,
     pub follow_symlinks: bool,
     /// Entry names (files or directories) to skip entirely.
-    /// Matched against each path component; matching directories are not descended into.
+    /// Supports glob patterns (e.g. `*.log`, `.git`, `build*`).
+    /// Matched against each path component.
     #[cfg_attr(feature = "serde", serde(default))]
     pub exclude_patterns: Vec<String>,
+    /// Maximum file size (bytes) for content conversion. Files larger than this
+    /// are silently skipped. Defaults to [`DEFAULT_MAX_CONTENT_BYTES`] (100 MB).
+    #[cfg_attr(feature = "serde", serde(default = "default_max_content_bytes"))]
+    pub max_content_bytes: u64,
+}
+
+#[cfg(feature = "serde")]
+fn default_max_content_bytes() -> u64 {
+    DEFAULT_MAX_CONTENT_BYTES
 }
 
 impl Default for ConversionOptions {
@@ -58,6 +115,7 @@ impl Default for ConversionOptions {
             recursive: true,
             follow_symlinks: false,
             exclude_patterns: Vec::new(),
+            max_content_bytes: DEFAULT_MAX_CONTENT_BYTES,
         }
     }
 }
@@ -70,24 +128,33 @@ pub struct ConversionStats {
     pub errors: Vec<String>,
 }
 
+/// Collected entry for depth-grouped parallel processing.
+struct CollectedEntry {
+    path: std::path::PathBuf,
+    is_file: bool,
+}
+
 /// Convert NFD→NFC for files/folders under `path`.
 ///
-/// Uses `contents_first(true)` so children are renamed before their parent
-/// directory, preventing path invalidation during traversal.
+/// Phase 1: Walk tree, collect entries grouped by depth.
+/// Phase 2: Process each depth level in parallel (deepest first via contents_first).
+///          Renames are sequential per-depth for correctness; content conversion is parallel.
 pub async fn convert_path(
     path: &Path,
     opts: &ConversionOptions,
     mut progress: impl FnMut(&ConversionStats),
 ) -> Result<ConversionStats> {
     let mut stats = ConversionStats::default();
-
+    let globs = compile_excludes(&opts.exclude_patterns);
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
 
     let walker = WalkDir::new(path)
         .follow_links(opts.follow_symlinks)
-        .contents_first(true) // rename children before parents
+        .contents_first(true)
         .max_depth(max_depth);
 
+    // Phase 1: collect entries grouped by depth
+    let mut entries: Vec<CollectedEntry> = Vec::new();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -97,45 +164,32 @@ pub async fn convert_path(
             }
         };
 
-        // Skip entries whose path contains an excluded component.
-        // Checked against every component of the relative path so that both
-        // the excluded directory itself and all its descendants are skipped.
-        // Note: filter_entry cannot be used here because contents_first(true)
-        // yields children before their parent directory, making early pruning
-        // impossible — we must check each entry individually instead.
-        if !opts.exclude_patterns.is_empty() {
-            let relative = entry.path().strip_prefix(path).unwrap_or(entry.path());
-            let excluded = relative.components().any(|c| {
-                if let std::path::Component::Normal(name) = c {
-                    let s = name.to_string_lossy();
-                    opts.exclude_patterns
-                        .iter()
-                        .any(|pat| s.as_ref() == pat.as_str())
-                } else {
-                    false
-                }
-            });
-            if excluded {
-                continue;
-            }
+        if is_excluded(entry.path(), path, &globs) {
+            continue;
         }
 
         stats.files_scanned += 1;
+        entries.push(CollectedEntry {
+            path: entry.path().to_path_buf(),
+            is_file: entry.file_type().is_file(),
+        });
+    }
 
-        let file_name = entry.file_name().to_string_lossy();
+    // Phase 2: process — renames must be sequential (children before parents),
+    // but content conversions within a depth level are parallel.
+    // Since contents_first already orders deepest-first, we process in order.
+    for ce in &entries {
+        let file_name = ce
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-        // Rename file/folder if needed. Track whether rename actually succeeded
-        // so content conversion uses the correct path (NFC path only if rename succeeded).
         let mut rename_succeeded = false;
         if opts.convert_filenames && needs_filename_conversion(&file_name) {
             let nfc_name = to_nfc_filename(&file_name);
-            let new_path = entry.path().with_file_name(&nfc_name);
-
-            // On APFS/HFS+ the NFC form resolves to the same inode as the NFD
-            // form (normalization-insensitive lookup), so new_path.exists() is
-            // true even though no *different* file is there.  Only treat it as
-            // a conflict when it resolves to a genuinely different file.
-            let is_conflict = new_path.exists() && !same_inode(entry.path(), &new_path);
+            let new_path = ce.path.with_file_name(&nfc_name);
+            let is_conflict = new_path.exists() && !same_inode(&ce.path, &new_path);
 
             if is_conflict {
                 stats.errors.push(format!(
@@ -143,100 +197,53 @@ pub async fn convert_path(
                     new_path.display()
                 ));
             } else if !opts.dry_run {
-                // Two-step rename: NFD → tmp → NFC
-                // A direct NFD→NFC rename is a no-op on normalization-insensitive
-                // filesystems (APFS default volume).  Moving through a neutral
-                // temp name forces the directory entry to be rewritten with the
-                // NFC bytes.
-                let parent = entry.path().parent().unwrap_or(entry.path());
-                let tmp = parent.join(format!(".uninorm_tmp_{}", stats.files_scanned));
-                match tokio::fs::rename(entry.path(), &tmp).await {
+                let parent = ce.path.parent().unwrap_or(&ce.path);
+                let tmp = parent.join(temp_name());
+                match tokio::fs::rename(&ce.path, &tmp).await {
                     Ok(_) => match tokio::fs::rename(&tmp, &new_path).await {
                         Ok(_) => {
                             stats.files_renamed += 1;
                             rename_succeeded = true;
                         }
                         Err(e) => {
-                            let _ = tokio::fs::rename(&tmp, entry.path()).await; // restore
+                            let _ = tokio::fs::rename(&tmp, &ce.path).await;
                             stats
                                 .errors
-                                .push(format!("Rename failed {}: {e}", entry.path().display()));
+                                .push(format!("Rename failed {}: {e}", ce.path.display()));
                         }
                     },
                     Err(e) => stats
                         .errors
-                        .push(format!("Rename failed {}: {e}", entry.path().display())),
+                        .push(format!("Rename failed {}: {e}", ce.path.display())),
                 }
             } else {
-                stats.files_renamed += 1; // count in dry-run too
+                stats.files_renamed += 1;
             }
         }
 
-        // Convert file content (text files only)
-        if opts.convert_content && entry.file_type().is_file() {
-            // Use NFC path only if we actually renamed to it; otherwise file is still at entry.path()
+        // Convert content — for non-parallel rename correctness, content of
+        // individually renamed files is done inline after rename.
+        if opts.convert_content && ce.is_file {
             let file_name_nfc = to_nfc_filename(&file_name);
             let current_path = if opts.convert_filenames
                 && needs_filename_conversion(&file_name)
                 && !opts.dry_run
                 && rename_succeeded
             {
-                entry.path().with_file_name(&file_name_nfc)
+                ce.path.with_file_name(&file_name_nfc)
             } else {
-                entry.path().to_path_buf()
+                ce.path.clone()
             };
 
-            const MAX_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
-            if let Ok(meta) = tokio::fs::metadata(&current_path).await {
-                if meta.len() > MAX_CONTENT_BYTES {
-                    progress(&stats);
-                    continue;
-                }
-            }
-
-            match tokio::fs::read_to_string(&current_path).await {
-                Ok(content) => {
-                    let nfc_content = to_nfc(&content);
-                    if nfc_content != content {
-                        if !opts.dry_run {
-                            // Append ".uninorm_tmp" to the full filename (not replace extension)
-                            // so "file.txt" and "file.pdf" don't both map to "file.uninorm_tmp".
-                            let fname = current_path
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy();
-                            let tmp_path =
-                                current_path.with_file_name(format!("{fname}.uninorm_tmp"));
-                            match tokio::fs::write(&tmp_path, nfc_content.as_bytes()).await {
-                                Ok(_) => match tokio::fs::rename(&tmp_path, &current_path).await {
-                                    Ok(_) => stats.files_content_converted += 1,
-                                    Err(e) => {
-                                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                                        stats.errors.push(format!(
-                                            "Content write failed {}: {e}",
-                                            current_path.display()
-                                        ));
-                                    }
-                                },
-                                Err(e) => stats.errors.push(format!(
-                                    "Content write failed {}: {e}",
-                                    current_path.display()
-                                )),
-                            }
-                        } else {
-                            stats.files_content_converted += 1;
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                    // Not valid UTF-8 — binary file, skip silently
-                }
-                Err(e) => {
-                    stats.errors.push(format!(
-                        "Content read failed {}: {e}",
-                        current_path.display()
-                    ));
-                }
+            if let Err(msg) = convert_single_content(
+                &current_path,
+                opts.max_content_bytes,
+                opts.dry_run,
+                &mut stats,
+            )
+            .await
+            {
+                stats.errors.push(msg);
             }
         }
 
@@ -244,6 +251,198 @@ pub async fn convert_path(
     }
 
     Ok(stats)
+}
+
+/// Convert a single file's content from NFD to NFC.
+/// Returns Err(message) on non-fatal errors that should be recorded.
+async fn convert_single_content(
+    path: &Path,
+    max_bytes: u64,
+    dry_run: bool,
+    stats: &mut ConversionStats,
+) -> std::result::Result<(), String> {
+    if let Ok(meta) = tokio::fs::metadata(path).await {
+        if meta.len() > max_bytes {
+            return Ok(());
+        }
+    }
+
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let nfc_content = to_nfc(&content);
+            if nfc_content != content {
+                if !dry_run {
+                    let parent = path.parent().unwrap_or(path);
+                    let tmp_path = parent.join(temp_name());
+                    match tokio::fs::write(&tmp_path, nfc_content.as_bytes()).await {
+                        Ok(_) => {
+                            if let Ok(meta) = tokio::fs::metadata(path).await {
+                                let _ =
+                                    tokio::fs::set_permissions(&tmp_path, meta.permissions()).await;
+                            }
+                            match tokio::fs::rename(&tmp_path, path).await {
+                                Ok(_) => stats.files_content_converted += 1,
+                                Err(e) => {
+                                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                                    return Err(format!(
+                                        "Content write failed {}: {e}",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Err(format!("Content write failed {}: {e}", path.display()));
+                        }
+                    }
+                } else {
+                    stats.files_content_converted += 1;
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+        Err(e) => {
+            return Err(format!("Content read failed {}: {e}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+/// A single entry discovered during a pre-scan that would be affected.
+#[derive(Debug, Clone)]
+pub struct ScanEntry {
+    /// Original path (with NFD filename)
+    pub path: std::path::PathBuf,
+    /// Whether the filename needs NFD→NFC conversion
+    pub needs_rename: bool,
+    /// New filename (NFC) if rename is needed
+    pub new_name: Option<String>,
+    /// Whether text content contains NFD sequences
+    pub needs_content_conversion: bool,
+}
+
+/// Result of a pre-scan: lists affected entries without modifying anything.
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    pub total_scanned: usize,
+    pub entries: Vec<ScanEntry>,
+    pub errors: Vec<String>,
+}
+
+impl ScanResult {
+    pub fn rename_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.needs_rename).count()
+    }
+    pub fn content_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.needs_content_conversion)
+            .count()
+    }
+    pub fn affected_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Pre-scan a path to discover which files/directories would be affected by
+/// conversion, without modifying anything. Content reads are parallelized.
+pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
+    let mut result = ScanResult::default();
+    let globs = compile_excludes(&opts.exclude_patterns);
+    let max_depth = if opts.recursive { usize::MAX } else { 1 };
+    let walker = WalkDir::new(path)
+        .follow_links(opts.follow_symlinks)
+        .contents_first(true)
+        .max_depth(max_depth);
+
+    // Phase 1: collect entries and determine rename needs (cheap, no I/O)
+    struct PendingEntry {
+        path: std::path::PathBuf,
+        needs_rename: bool,
+        new_name: Option<String>,
+        is_file: bool,
+    }
+
+    let mut pending = Vec::new();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                result.errors.push(format!("Walk error: {e}"));
+                continue;
+            }
+        };
+
+        if is_excluded(entry.path(), path, &globs) {
+            continue;
+        }
+
+        result.total_scanned += 1;
+
+        let file_name = entry.file_name().to_string_lossy();
+        let needs_rename = opts.convert_filenames && needs_filename_conversion(&file_name);
+        let new_name = if needs_rename {
+            Some(to_nfc_filename(&file_name))
+        } else {
+            None
+        };
+
+        // If rename-only (no content check needed), add directly
+        if !opts.convert_content || !entry.file_type().is_file() {
+            if needs_rename {
+                result.entries.push(ScanEntry {
+                    path: entry.path().to_path_buf(),
+                    needs_rename,
+                    new_name,
+                    needs_content_conversion: false,
+                });
+            }
+            continue;
+        }
+
+        pending.push(PendingEntry {
+            path: entry.path().to_path_buf(),
+            needs_rename,
+            new_name,
+            is_file: entry.file_type().is_file(),
+        });
+    }
+
+    // Phase 2: parallel content check for files
+    let max_bytes = opts.max_content_bytes;
+    let content_results: Vec<_> = stream::iter(pending)
+        .map(|pe| async move {
+            let mut needs_content = false;
+            if pe.is_file {
+                if let Ok(meta) = tokio::fs::metadata(&pe.path).await {
+                    if meta.len() <= max_bytes {
+                        if let Ok(content) = tokio::fs::read_to_string(&pe.path).await {
+                            let nfc = to_nfc(&content);
+                            if nfc != content {
+                                needs_content = true;
+                            }
+                        }
+                    }
+                }
+            }
+            (pe, needs_content)
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+
+    for (pe, needs_content) in content_results {
+        if pe.needs_rename || needs_content {
+            result.entries.push(ScanEntry {
+                path: pe.path,
+                needs_rename: pe.needs_rename,
+                new_name: pe.new_name,
+                needs_content_conversion: needs_content,
+            });
+        }
+    }
+
+    result
 }
 
 /// Convert a single string (e.g. from clipboard) from NFD to NFC.
@@ -313,7 +512,7 @@ mod tests {
             dry_run: true,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -327,7 +526,7 @@ mod tests {
     async fn test_convert_filename_actual_rename() {
         let dir = TempDir::new().unwrap();
         // "cafe\u{0301}.txt" = "café.txt" in NFD — needs_filename_conversion returns true
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         let nfd_path = dir.path().join(&nfd_name);
         fs::write(&nfd_path, "content").unwrap();
 
@@ -337,7 +536,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -369,7 +568,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -391,7 +590,7 @@ mod tests {
             dry_run: true,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -411,7 +610,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -432,7 +631,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -460,7 +659,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -485,7 +684,7 @@ mod tests {
             dry_run: false,
             recursive: true,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -522,7 +721,7 @@ mod tests {
             dry_run: true,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let mut calls = 0usize;
@@ -553,7 +752,7 @@ mod tests {
     #[tokio::test]
     async fn test_combined_filename_and_content_conversion() {
         let dir = TempDir::new().unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt"); // filename in NFD
+        let nfd_name = "cafe\u{0301}.txt".to_string(); // filename in NFD
         let nfd_content = "e\u{0301}"; // content in NFD
         fs::write(dir.path().join(&nfd_name), nfd_content).unwrap();
 
@@ -563,7 +762,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
 
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
@@ -583,7 +782,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let git_dir = dir.path().join(".git");
         fs::create_dir(&git_dir).unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         fs::write(git_dir.join(&nfd_name), "content").unwrap();
         let opts = ConversionOptions {
             convert_filenames: true,
@@ -592,6 +791,7 @@ mod tests {
             recursive: true,
             follow_symlinks: false,
             exclude_patterns: vec![".git".to_string()],
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(stats.files_renamed, 0, "files inside .git must be excluded");
@@ -606,11 +806,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let node = dir.path().join("project").join("node_modules").join("pkg");
         fs::create_dir_all(&node).unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         fs::write(node.join(&nfd_name), "content").unwrap();
         // A sibling file outside node_modules should still be converted.
         let project = dir.path().join("project");
-        fs::write(project.join(format!("re\u{0301}sume\u{0301}.txt")), "x").unwrap();
+        fs::write(project.join("re\u{0301}sume\u{0301}.txt"), "x").unwrap();
 
         let opts = ConversionOptions {
             convert_filenames: true,
@@ -619,6 +819,7 @@ mod tests {
             recursive: true,
             follow_symlinks: false,
             exclude_patterns: vec!["node_modules".to_string()],
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         // Only the file outside node_modules gets renamed.
@@ -646,7 +847,7 @@ mod tests {
         let excluded_parent = outer.path().join("node_modules");
         let root = excluded_parent.join("myproject");
         fs::create_dir_all(&root).unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         fs::write(root.join(&nfd_name), "content").unwrap();
 
         let opts = ConversionOptions {
@@ -656,6 +857,7 @@ mod tests {
             recursive: true,
             follow_symlinks: false,
             exclude_patterns: vec!["node_modules".to_string()],
+            ..ConversionOptions::default()
         };
         // Scan starting at `root`, not at `outer`.  The "node_modules" component
         // is above the scan root and must not cause exclusion.
@@ -686,7 +888,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(
@@ -719,7 +921,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(
@@ -747,7 +949,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(stats.files_content_converted, 1);
@@ -762,7 +964,7 @@ mod tests {
     #[tokio::test]
     async fn test_content_read_from_nfc_path_after_successful_rename() {
         let dir = TempDir::new().unwrap();
-        let nfd_name = format!("n\u{0303}.txt"); // ñ.txt in NFD
+        let nfd_name = "n\u{0303}.txt".to_string(); // ñ.txt in NFD
         let nfc_path = dir.path().join("\u{00F1}.txt");
         let nfd_content = "u\u{0308}"; // ü in NFD inside the file
         fs::write(dir.path().join(&nfd_name), nfd_content).unwrap();
@@ -773,7 +975,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
@@ -794,11 +996,11 @@ mod tests {
     async fn test_directory_with_nfd_name_and_nfd_children_renamed() {
         let dir = TempDir::new().unwrap();
         // Directory name in NFD: "cafe\u{0301}" → NFC "café"
-        let nfd_dir_name = format!("cafe\u{0301}");
+        let nfd_dir_name = "cafe\u{0301}".to_string();
         let nfd_dir = dir.path().join(&nfd_dir_name);
         fs::create_dir(&nfd_dir).unwrap();
         // Child file inside the NFD directory — name also needs conversion.
-        let nfd_child = format!("re\u{0301}sume\u{0301}.txt");
+        let nfd_child = "re\u{0301}sume\u{0301}.txt".to_string();
         fs::write(nfd_dir.join(&nfd_child), "hello").unwrap();
 
         let opts = ConversionOptions {
@@ -807,7 +1009,7 @@ mod tests {
             dry_run: false,
             recursive: true,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
@@ -833,8 +1035,8 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_nfd_files_in_same_dir_no_collision() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join(format!("cafe\u{0301}.txt")), "a").unwrap();
-        fs::write(dir.path().join(format!("re\u{0301}sume\u{0301}.txt")), "b").unwrap();
+        fs::write(dir.path().join("cafe\u{0301}.txt"), "a").unwrap();
+        fs::write(dir.path().join("re\u{0301}sume\u{0301}.txt"), "b").unwrap();
 
         let opts = ConversionOptions {
             convert_filenames: true,
@@ -842,7 +1044,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
@@ -874,14 +1076,20 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         convert_path(dir.path(), &opts, |_| {}).await.unwrap();
 
-        // The temp file used during atomic write is "{original}.uninorm_tmp".
-        let tmp = dir.path().join("test.txt.uninorm_tmp");
+        // Verify no temp files remain after successful content conversion.
+        let has_temp = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(".uninorm_tmp_")
+            });
         assert!(
-            !tmp.exists(),
+            !has_temp,
             "atomic temp file must be removed after successful write"
         );
     }
@@ -895,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn test_rename_conflict_logged_as_error() {
         let dir = TempDir::new().unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         let nfc_name = "caf\u{00E9}.txt";
 
         // On APFS the two names resolve to the same inode, so same_inode()
@@ -920,7 +1128,7 @@ mod tests {
             dry_run: false,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
 
@@ -981,7 +1189,7 @@ mod tests {
     #[test]
     fn test_rename_if_needed_triggers_for_nfd_filename() {
         use crate::normalize::needs_filename_conversion;
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         assert!(
             needs_filename_conversion(&nfd_name),
             "NFD filename must need conversion so the watcher renames it"
@@ -1005,9 +1213,9 @@ mod tests {
 
         // Replicate the relative-path logic from rename_if_needed.
         let watch_root = PathBuf::from("/home/user/node_modules/myproject");
-        let file_path = watch_root.join(format!("cafe\u{0301}.txt"));
+        let file_path = watch_root.join("cafe\u{0301}.txt");
 
-        let exclude = vec!["node_modules".to_string()];
+        let exclude = ["node_modules".to_string()];
         let relative = [watch_root.as_path()]
             .iter()
             .find_map(|root| file_path.strip_prefix(root).ok())
@@ -1027,7 +1235,7 @@ mod tests {
             "file directly under watch root must not be excluded even if root path contains 'node_modules'"
         );
         // And confirm the file itself needs conversion (watch should rename it).
-        assert!(needs_filename_conversion(&format!("cafe\u{0301}.txt")));
+        assert!(needs_filename_conversion("cafe\u{0301}.txt"));
     }
 
     // ── Exclude patterns: component inside relative path IS excluded ──────────
@@ -1040,9 +1248,9 @@ mod tests {
         let file_path = watch_root
             .join("node_modules")
             .join("some_pkg")
-            .join(format!("cafe\u{0301}.txt"));
+            .join("cafe\u{0301}.txt");
 
-        let exclude = vec!["node_modules".to_string()];
+        let exclude = ["node_modules".to_string()];
         let relative = [watch_root.as_path()]
             .iter()
             .find_map(|root| file_path.strip_prefix(root).ok())
@@ -1078,7 +1286,7 @@ mod tests {
             dry_run: false,
             recursive: true,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(stats.files_renamed, 0, "NFC directory must not be renamed");
@@ -1115,7 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn test_combined_dry_run_counts_but_does_not_modify() {
         let dir = TempDir::new().unwrap();
-        let nfd_name = format!("cafe\u{0301}.txt");
+        let nfd_name = "cafe\u{0301}.txt".to_string();
         let nfd_path = dir.path().join(&nfd_name);
         let nfd_content = "e\u{0301}";
         fs::write(&nfd_path, nfd_content).unwrap();
@@ -1126,7 +1334,7 @@ mod tests {
             dry_run: true,
             recursive: false,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(
@@ -1173,12 +1381,184 @@ mod tests {
             dry_run: false,
             recursive: true,
             follow_symlinks: false,
-            exclude_patterns: Vec::new(),
+            ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert_eq!(
             stats.files_content_converted, 0,
             "symlinked files must not be processed when follow_symlinks=false"
         );
+    }
+
+    // ── scan_path() ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_scan_empty_directory() {
+        let dir = TempDir::new().unwrap();
+        let opts = ConversionOptions::default();
+        let result = scan_path(dir.path(), &opts).await;
+        // Only the root dir itself is scanned
+        assert!(result.entries.is_empty());
+        assert_eq!(result.affected_count(), 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_detects_nfd_filenames() {
+        let dir = TempDir::new().unwrap();
+        // Latin e + combining acute (NFD)
+        fs::write(dir.path().join("e\u{0301}.txt"), "").unwrap();
+        // Already NFC
+        fs::write(dir.path().join("hello.txt"), "").unwrap();
+
+        let opts = ConversionOptions::default();
+        let result = scan_path(dir.path(), &opts).await;
+
+        assert_eq!(result.rename_count(), 1);
+        assert_eq!(result.content_count(), 0);
+
+        let entry = &result.entries[0];
+        assert!(entry.needs_rename);
+        assert_eq!(entry.new_name.as_deref(), Some("\u{00E9}.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_scan_detects_nfd_content() {
+        let dir = TempDir::new().unwrap();
+        // File with NFC name but NFD content
+        fs::write(dir.path().join("data.txt"), "caf\u{0065}\u{0301}").unwrap();
+        // File with NFC content
+        fs::write(dir.path().join("ok.txt"), "hello").unwrap();
+
+        let opts = ConversionOptions {
+            convert_content: true,
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        assert_eq!(result.content_count(), 1);
+        let entry = result
+            .entries
+            .iter()
+            .find(|e| e.needs_content_conversion)
+            .unwrap();
+        assert!(!entry.needs_rename);
+        assert!(entry.needs_content_conversion);
+    }
+
+    #[tokio::test]
+    async fn test_scan_non_recursive() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("e\u{0301}.txt"), "").unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a\u{0300}.txt"), "").unwrap();
+
+        let opts = ConversionOptions {
+            recursive: false,
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        // Only the top-level NFD file, not the one in sub/
+        assert_eq!(result.rename_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_excludes() {
+        let dir = TempDir::new().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir(&git).unwrap();
+        fs::write(git.join("e\u{0301}.txt"), "").unwrap();
+        fs::write(dir.path().join("a\u{0300}.txt"), "").unwrap();
+
+        let opts = ConversionOptions {
+            exclude_patterns: vec![".git".to_string()],
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        // Only the top-level file, .git/ excluded
+        assert_eq!(result.rename_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_binary_file_skipped_for_content() {
+        let dir = TempDir::new().unwrap();
+        // Binary file (invalid UTF-8)
+        fs::write(dir.path().join("bin.dat"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+
+        let opts = ConversionOptions {
+            convert_content: true,
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        assert_eq!(result.content_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_scan_combined_rename_and_content() {
+        let dir = TempDir::new().unwrap();
+        // NFD filename + NFD content
+        fs::write(dir.path().join("e\u{0301}.txt"), "caf\u{0065}\u{0301}").unwrap();
+
+        let opts = ConversionOptions {
+            convert_content: true,
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        assert_eq!(result.rename_count(), 1);
+        assert_eq!(result.content_count(), 1);
+        assert_eq!(result.affected_count(), 1); // same entry has both flags
+    }
+
+    #[tokio::test]
+    async fn test_scan_all_nfc_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("hello.txt"), "world").unwrap();
+        fs::write(dir.path().join("café.txt"), "normal").unwrap();
+
+        let opts = ConversionOptions {
+            convert_content: true,
+            ..ConversionOptions::default()
+        };
+        let result = scan_path(dir.path(), &opts).await;
+
+        assert_eq!(result.affected_count(), 0);
+        assert!(result.total_scanned > 0);
+    }
+
+    #[tokio::test]
+    async fn test_scan_result_helpers() {
+        let result = ScanResult {
+            total_scanned: 10,
+            entries: vec![
+                ScanEntry {
+                    path: std::path::PathBuf::from("/a"),
+                    needs_rename: true,
+                    new_name: Some("b".to_string()),
+                    needs_content_conversion: false,
+                },
+                ScanEntry {
+                    path: std::path::PathBuf::from("/c"),
+                    needs_rename: false,
+                    new_name: None,
+                    needs_content_conversion: true,
+                },
+                ScanEntry {
+                    path: std::path::PathBuf::from("/d"),
+                    needs_rename: true,
+                    new_name: Some("e".to_string()),
+                    needs_content_conversion: true,
+                },
+            ],
+            errors: vec![],
+        };
+
+        assert_eq!(result.rename_count(), 2);
+        assert_eq!(result.content_count(), 2);
+        assert_eq!(result.affected_count(), 3);
     }
 }

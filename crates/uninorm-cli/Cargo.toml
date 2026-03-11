@@ -13,6 +13,10 @@ name = "uninorm"
 path = "src/main.rs"
 test = false  # clipboard APIs need entitlements; no unit tests in this binary
 
+[lib]
+name = "uninorm_cli"
+path = "src/lib.rs"
+
 [dependencies]
 uninorm-core = { workspace = true }
 clap = { workspace = true }
@@ -21,8 +25,15 @@ tokio = { workspace = true }
 indicatif = { workspace = true }
 arboard = { workspace = true }
 notify = "8"
+globset = { workspace = true }
+walkdir = { workspace = true }
 dirs = "6"
 chrono = { version = "0.4", features = ["clock"] }
+serde = { workspace = true }
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
