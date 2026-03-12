@@ -28,17 +28,23 @@ impl DaemonController {
             }
 
             crate::daemon::spawn_daemon().map_err(DaemonError::Spawn)?;
-            std::thread::sleep(std::time::Duration::from_millis(300));
 
-            config::read_pid().ok_or_else(|| {
-                DaemonError::Spawn(std::io::Error::other(
-                    "daemon did not write PID file after spawn",
-                ))
-            })
+            // Poll for PID file with exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms)
+            let mut delay_ms = 100u64;
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if let Some(pid) = config::read_pid() {
+                    return Ok(pid);
+                }
+                delay_ms *= 2;
+            }
+            Err(DaemonError::Spawn(std::io::Error::other(
+                "daemon did not write PID file after spawn (timed out after ~3s)",
+            )))
         }
     }
 
-    /// Stop the running daemon. Returns Ok(()) even if already stopped.
+    /// Stop the running daemon. Waits up to ~2s for the daemon to exit.
     pub fn stop() -> Result<()> {
         #[cfg(not(unix))]
         {
@@ -51,6 +57,16 @@ impl DaemonController {
                 return Err(DaemonError::NotRunning);
             }
             config::signal_daemon(libc::SIGTERM);
+
+            // Poll until daemon exits (100ms intervals, up to ~2s)
+            for _ in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !config::is_daemon_running() {
+                    return Ok(());
+                }
+            }
+            // Daemon didn't exit gracefully — still report OK but remove stale PID
+            config::remove_pid();
             Ok(())
         }
     }

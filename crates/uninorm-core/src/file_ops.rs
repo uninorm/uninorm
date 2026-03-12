@@ -385,7 +385,10 @@ impl ScanResult {
 /// conversion, without modifying anything. Content reads are parallelized.
 pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
     let mut result = ScanResult::default();
-    let (globs, _invalid_patterns) = compile_excludes(&opts.exclude_patterns);
+    let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
+    for pat in &invalid_patterns {
+        result.errors.push(format!("Invalid exclude pattern ignored: {pat}"));
+    }
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
     let walker = WalkDir::new(path)
         .follow_links(opts.follow_symlinks)

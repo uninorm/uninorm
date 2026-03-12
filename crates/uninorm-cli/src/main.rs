@@ -278,8 +278,9 @@ fn read_tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<Stri
     let chunk_size = 64 * 1024u64;
     let start_pos = file_len.saturating_sub(chunk_size);
     file.seek(SeekFrom::Start(start_pos))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+    let buf = String::from_utf8_lossy(&raw);
 
     let all_lines: Vec<&str> = buf.lines().collect();
     // If we seeked into the middle, the first line may be partial

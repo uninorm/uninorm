@@ -47,6 +47,9 @@ pub fn spawn_daemon() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Mutex protecting log rotation from concurrent access.
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Append a timestamped log entry, with size-based rotation.
 pub fn append_log(message: &str) {
     let Ok(path) = config::log_path() else {
@@ -55,6 +58,8 @@ pub fn append_log(message: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // Rotate if over limit (keep 2 generations: .log.1, .log.2)
     if let Ok(meta) = std::fs::metadata(&path) {
@@ -78,9 +83,9 @@ pub fn append_log(message: &str) {
     }
 }
 
-/// Check if a filename is a uninorm temp file (rename prefix or content suffix).
+/// Check if a filename is a uninorm temp file.
 fn is_temp_file(name: &str) -> bool {
-    name.starts_with(".uninorm_tmp_") || name.ends_with(".uninorm_tmp")
+    name.starts_with(".uninorm_tmp_")
 }
 
 /// Clean up stale temp files left by a previous crash.
@@ -386,6 +391,7 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
 
                     let batch = std::mem::take(&mut pending_paths);
 
+                    let mut handles = Vec::new();
                     let compiled_ref = &compiled;
                     for (path, is_name_event) in &batch {
                         let Some(ce) = find_entry_for_path(path, compiled_ref) else {
@@ -401,7 +407,7 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
                         let max_bytes = ce.entry.max_content_bytes
                             .unwrap_or(uninorm_core::DEFAULT_MAX_CONTENT_BYTES);
 
-                        let messages = tokio::task::spawn_blocking(move || {
+                        handles.push(tokio::task::spawn_blocking(move || {
                             let mut msgs = Vec::new();
 
                             if !follow_symlinks {
@@ -433,8 +439,13 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
                             }
 
                             msgs
-                        }).await.unwrap_or_default();
+                        }));
+                    }
 
+                    for handle in handles {
+                        let messages = handle.await.unwrap_or_else(|e| {
+                            vec![format!("Error: spawn_blocking task failed: {e}")]
+                        });
                         for msg in messages {
                             append_log(&msg);
                         }
