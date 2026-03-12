@@ -159,7 +159,10 @@ pub fn is_daemon_running() -> bool {
 #[cfg(unix)]
 fn is_our_daemon(pid: u32) -> bool {
     // First check: is the process alive?
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    let Some(pid_t) = libc::pid_t::try_from(pid).ok() else {
+        return false;
+    };
+    let alive = unsafe { libc::kill(pid_t, 0) == 0 };
     if !alive {
         return false;
     }

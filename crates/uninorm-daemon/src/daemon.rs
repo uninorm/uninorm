@@ -99,11 +99,23 @@ fn cleanup_stale_temps(wc: &WatchConfig) {
         for dir_entry in walker.into_iter().flatten() {
             if let Some(name) = dir_entry.file_name().to_str() {
                 if is_temp_file(name) {
-                    let _ = std::fs::remove_file(dir_entry.path());
-                    append_log(&format!(
-                        "Cleaned stale temp: {}",
-                        dir_entry.path().display()
-                    ));
+                    let path = dir_entry.path();
+                    // Preserve data: rename to .uninorm_orphan_ instead of deleting
+                    let orphan_name = name.replace(".uninorm_tmp_", ".uninorm_orphan_");
+                    let orphan_path = path.with_file_name(&orphan_name);
+                    match std::fs::rename(path, &orphan_path) {
+                        Ok(_) => append_log(&format!(
+                            "Warning: recovered stale temp as orphan: {} (please review and rename manually)",
+                            orphan_path.display()
+                        )),
+                        Err(_) => {
+                            // If rename fails, leave the temp file as-is rather than deleting data
+                            append_log(&format!(
+                                "Warning: stale temp file found, could not recover: {}",
+                                path.display()
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -285,7 +297,7 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
             return Ok(());
         }
 
-        let debounce_ms = watch_config.debounce_ms.unwrap_or(300);
+        let debounce_ms = watch_config.debounce_ms.unwrap_or(300).max(10);
 
         {
             let cfg_ref = watch_config.clone();
@@ -391,53 +403,70 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
 
                     let batch = std::mem::take(&mut pending_paths);
 
-                    let mut handles = Vec::new();
+                    // Group by parent directory to serialize renames within each dir
+                    // (prevents TOCTOU races on conflict checks), while parallelizing across dirs.
+                    let mut by_dir: HashMap<PathBuf, Vec<(PathBuf, bool)>> = HashMap::new();
                     let compiled_ref = &compiled;
-                    for (path, is_name_event) in &batch {
-                        let Some(ce) = find_entry_for_path(path, compiled_ref) else {
+                    for (path, is_name_event) in batch {
+                        let dir = path.parent().unwrap_or(&path).to_path_buf();
+                        by_dir.entry(dir).or_default().push((path, is_name_event));
+                    }
+
+                    let mut handles = Vec::new();
+                    for (_, dir_entries) in by_dir {
+                        // Collect per-directory context
+                        let mut tasks: Vec<(PathBuf, bool, PathBuf, globset::GlobSet, bool, bool, u64)> = Vec::new();
+                        for (path, is_name) in dir_entries {
+                            let Some(ce) = find_entry_for_path(&path, compiled_ref) else {
+                                continue;
+                            };
+                            tasks.push((
+                                path,
+                                is_name,
+                                ce.entry.path.clone(),
+                                ce.globs.clone(),
+                                ce.entry.content,
+                                ce.entry.follow_symlinks,
+                                ce.entry.max_content_bytes
+                                    .unwrap_or(uninorm_core::DEFAULT_MAX_CONTENT_BYTES),
+                            ));
+                        }
+                        if tasks.is_empty() {
                             continue;
-                        };
+                        }
 
-                        let path = path.clone();
-                        let is_name = *is_name_event;
-                        let entry_path = ce.entry.path.clone();
-                        let globs = ce.globs.clone();
-                        let content_enabled = ce.entry.content;
-                        let follow_symlinks = ce.entry.follow_symlinks;
-                        let max_bytes = ce.entry.max_content_bytes
-                            .unwrap_or(uninorm_core::DEFAULT_MAX_CONTENT_BYTES);
-
+                        // One spawn_blocking per directory — sequential within, parallel across
                         handles.push(tokio::task::spawn_blocking(move || {
                             let mut msgs = Vec::new();
-
-                            if !follow_symlinks {
-                                if let Ok(m) = std::fs::symlink_metadata(&path) {
-                                    if m.file_type().is_symlink() {
-                                        return msgs;
+                            for (path, is_name, entry_path, globs, content_enabled, follow_symlinks, max_bytes) in tasks {
+                                if !follow_symlinks {
+                                    if let Ok(m) = std::fs::symlink_metadata(&path) {
+                                        if m.file_type().is_symlink() {
+                                            continue;
+                                        }
                                     }
                                 }
-                            }
 
-                            let nfc_path = if is_name {
-                                let ce_inline = InlineCompiledEntry { entry_path: &entry_path, globs: &globs };
-                                let (msg, renamed_path) = rename_if_needed_inline(&path, &ce_inline);
-                                if let Some(msg) = msg {
-                                    msgs.push(msg);
-                                }
-                                renamed_path
-                            } else {
-                                None
-                            };
-
-                            if content_enabled {
-                                let target = nfc_path.as_deref().unwrap_or(&path);
-                                if !uninorm_core::is_excluded(target, &entry_path, &globs) {
-                                    if let Some(msg) = convert_content_if_needed(target, max_bytes) {
+                                let nfc_path = if is_name {
+                                    let ce_inline = InlineCompiledEntry { entry_path: &entry_path, globs: &globs };
+                                    let (msg, renamed_path) = rename_if_needed_inline(&path, &ce_inline);
+                                    if let Some(msg) = msg {
                                         msgs.push(msg);
                                     }
+                                    renamed_path
+                                } else {
+                                    None
+                                };
+
+                                if content_enabled {
+                                    let target = nfc_path.as_deref().unwrap_or(&path);
+                                    if !uninorm_core::is_excluded(target, &entry_path, &globs) {
+                                        if let Some(msg) = convert_content_if_needed(target, max_bytes) {
+                                            msgs.push(msg);
+                                        }
+                                    }
                                 }
                             }
-
                             msgs
                         }));
                     }

@@ -56,7 +56,11 @@ impl DaemonController {
             if !config::is_daemon_running() {
                 return Err(DaemonError::NotRunning);
             }
-            config::signal_daemon(libc::SIGTERM);
+            if !config::signal_daemon(libc::SIGTERM) {
+                return Err(DaemonError::Io(std::io::Error::other(
+                    "failed to send SIGTERM to daemon",
+                )));
+            }
 
             // Poll until daemon exits (100ms intervals, up to ~2s)
             for _ in 0..20 {
