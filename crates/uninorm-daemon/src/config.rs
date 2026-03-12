@@ -172,7 +172,7 @@ fn is_our_daemon(pid: u32) -> bool {
         let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         let ret = unsafe {
             libc::proc_pidpath(
-                pid as i32,
+                pid_t,
                 buf.as_mut_ptr() as *mut libc::c_void,
                 buf.len() as u32,
             )
@@ -214,7 +214,10 @@ pub fn signal_daemon(sig: i32) -> bool {
     }
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+        let Some(pid_t) = libc::pid_t::try_from(pid).ok() else {
+            return false;
+        };
+        unsafe { libc::kill(pid_t, sig) == 0 }
     }
     #[cfg(not(unix))]
     {
