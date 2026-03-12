@@ -186,7 +186,12 @@ fn convert_content_if_needed(path: &Path, max_bytes: u64) -> Option<String> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return None,
+        Err(e) => {
+            return Some(format!(
+                "Error: cannot read metadata for {}: {e}",
+                path.display()
+            ));
+        }
     };
 
     if !meta.is_file() || meta.len() > max_bytes {
@@ -195,7 +200,15 @@ fn convert_content_if_needed(path: &Path, max_bytes: u64) -> Option<String> {
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return None,
+        // Binary or non-UTF8 files — silently skip (not an error)
+        Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData => return None,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(format!(
+                "Error: cannot read {}: {e}",
+                path.display()
+            ));
+        }
     };
 
     let nfc = uninorm_core::convert_text(&content);
@@ -235,9 +248,19 @@ fn find_entry_for_path<'a>(
     entries.iter().find(|ce| path.starts_with(&ce.entry.path))
 }
 
+/// Guard that removes the PID file when dropped (panic, early return, normal exit).
+struct PidGuard;
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        config::remove_pid();
+    }
+}
+
 /// Main daemon loop. Called by the hidden `daemon` subcommand.
 pub async fn run_daemon() -> Result<()> {
     config::write_pid(std::process::id())?;
+    let _pid_guard = PidGuard;
     append_log("Daemon started");
 
     run_daemon_platform().await
@@ -257,7 +280,6 @@ async fn run_daemon_platform() -> Result<()> {
         let has_enabled = watch_config.entries.iter().any(|e| e.enabled);
         if !has_enabled {
             append_log("No enabled watch entries — daemon exiting");
-            config::remove_pid();
             return Ok(());
         }
 
@@ -313,7 +335,6 @@ async fn run_daemon_platform() -> Result<()> {
 
         if watch_ok == 0 {
             append_log("All watch paths failed — daemon exiting");
-            config::remove_pid();
             return Ok(());
         }
 
@@ -437,12 +458,10 @@ async fn run_daemon_platform() -> Result<()> {
                 }
                 _ = sigterm.recv() => {
                     append_log("Daemon stopped (SIGTERM)");
-                    config::remove_pid();
                     return Ok(());
                 }
                 _ = tokio::signal::ctrl_c() => {
                     append_log("Daemon stopped (SIGINT)");
-                    config::remove_pid();
                     return Ok(());
                 }
             }

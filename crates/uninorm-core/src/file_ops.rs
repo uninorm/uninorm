@@ -43,7 +43,7 @@ pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
     }
     let set = builder
         .build()
-        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().expect("empty GlobSet must build"));
     (set, invalid)
 }
 
@@ -210,7 +210,13 @@ pub async fn convert_path(
                     new_path.display()
                 ));
             } else if !opts.dry_run {
-                let parent = ce.path.parent().unwrap_or(&ce.path);
+                let Some(parent) = ce.path.parent() else {
+                    stats.errors.push(format!(
+                        "Cannot rename root path: {}",
+                        ce.path.display()
+                    ));
+                    continue;
+                };
                 let tmp = parent.join(temp_name());
                 match tokio::fs::rename(&ce.path, &tmp).await {
                     Ok(_) => match tokio::fs::rename(&tmp, &new_path).await {
@@ -281,9 +287,15 @@ async fn convert_single_content(
     dry_run: bool,
     stats: &mut ConversionStats,
 ) -> std::result::Result<(), String> {
-    if let Ok(meta) = tokio::fs::metadata(path).await {
-        if meta.len() > max_bytes {
-            return Ok(());
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => {
+            if meta.len() > max_bytes {
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!("Metadata read failed {}: {e}", path.display()));
         }
     }
 
@@ -292,7 +304,12 @@ async fn convert_single_content(
             let nfc_content = to_nfc(&content);
             if nfc_content != content {
                 if !dry_run {
-                    let parent = path.parent().unwrap_or(path);
+                    let Some(parent) = path.parent() else {
+                        return Err(format!(
+                            "Cannot determine parent directory for: {}",
+                            path.display()
+                        ));
+                    };
                     let tmp_path = parent.join(temp_name());
                     match tokio::fs::write(&tmp_path, nfc_content.as_bytes()).await {
                         Ok(_) => {
