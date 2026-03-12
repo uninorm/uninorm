@@ -472,5 +472,8 @@ async fn run_daemon_platform() -> Result<()> {
 
 #[cfg(not(unix))]
 async fn run_daemon_platform() -> Result<()> {
-    anyhow::bail!("Background daemon is only supported on Unix systems");
+    anyhow::bail!(
+        "Background watch daemon is only available on macOS.\n\
+         Use `uninorm files <path>` to batch-convert NFD filenames."
+    );
 }

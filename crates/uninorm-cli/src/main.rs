@@ -548,8 +548,11 @@ async fn main() -> Result<()> {
                 }
                 #[cfg(not(unix))]
                 {
-                    eprintln!("Background daemon is not supported on this platform.");
-                    eprintln!("Use `uninorm files` for manual conversion.");
+                    eprintln!("Background watch daemon is only available on macOS.");
+                    eprintln!();
+                    eprintln!("On Windows/Linux, use `uninorm files <path>` to batch-convert");
+                    eprintln!("NFD filenames (e.g. files synced from iCloud or macOS).");
+                    std::process::exit(1);
                 }
             }
 
@@ -565,7 +568,8 @@ async fn main() -> Result<()> {
                 }
                 #[cfg(not(unix))]
                 {
-                    println!("Background daemon is not supported on this platform.");
+                    eprintln!("Background watch daemon is only available on macOS.");
+                    eprintln!("Use `uninorm files <path>` to batch-convert NFD filenames.");
                 }
             }
 
