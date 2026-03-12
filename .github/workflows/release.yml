@@ -5,70 +5,207 @@ on:
     tags: ["v*"]
 
 jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS-arm64
+            target: aarch64-apple-darwin
+            os: macos-latest
+          - name: macOS-x86_64
+            target: x86_64-apple-darwin
+            os: macos-latest
+          - name: Linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - name: Linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - name: Windows-x86_64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install X11 libs (Linux native)
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: sudo apt-get update -q && sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p uninorm
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p uninorm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uninorm-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/uninorm
+            target/${{ matrix.target }}/release/uninorm.exe
+
   release:
+    name: Release
+    needs: build
     runs-on: macos-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          path: artifacts
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run tests
-        run: cargo test --workspace
-
-      # ── CLI universal binary ──────────────────────────────────────────────
-      - name: Build CLI (arm64)
-        run: cargo build --release --target aarch64-apple-darwin -p uninorm
-
-      - name: Build CLI (x86_64)
-        run: cargo build --release --target x86_64-apple-darwin -p uninorm
-
-      - name: Lipo CLI → universal
+      - name: Create release archives
         run: |
+          # macOS universal binary
           lipo -create \
-            target/aarch64-apple-darwin/release/uninorm \
-            target/x86_64-apple-darwin/release/uninorm \
+            artifacts/uninorm-aarch64-apple-darwin/uninorm \
+            artifacts/uninorm-x86_64-apple-darwin/uninorm \
             -output uninorm
           chmod +x uninorm
           zip uninorm-macos-universal.zip uninorm
+          rm uninorm
 
-      # ── GitHub Release ────────────────────────────────────────────────────
+          # Linux x86_64
+          cp artifacts/uninorm-x86_64-unknown-linux-gnu/uninorm uninorm
+          chmod +x uninorm
+          tar czf uninorm-linux-x86_64.tar.gz uninorm
+          rm uninorm
+
+          # Linux aarch64
+          cp artifacts/uninorm-aarch64-unknown-linux-gnu/uninorm uninorm
+          chmod +x uninorm
+          tar czf uninorm-linux-aarch64.tar.gz uninorm
+          rm uninorm
+
+          # Windows x86_64
+          cp artifacts/uninorm-x86_64-pc-windows-msvc/uninorm.exe uninorm.exe
+          zip uninorm-windows-x86_64.zip uninorm.exe
+          rm uninorm.exe
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             uninorm-macos-universal.zip
+            uninorm-linux-x86_64.tar.gz
+            uninorm-linux-aarch64.tar.gz
+            uninorm-windows-x86_64.zip
           generate_release_notes: true
 
-      # ── Update Homebrew tap ───────────────────────────────────────────────
+      # ── Update Homebrew tap ───────────────────────────────────────────
       - name: Update Homebrew formula
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          SHA=$(shasum -a 256 uninorm-macos-universal.zip | cut -d' ' -f1)
           VERSION=${GITHUB_REF_NAME#v}
-          URL="https://github.com/uninorm/uninorm/releases/download/${GITHUB_REF_NAME}/uninorm-macos-universal.zip"
+          SHA_MACOS=$(shasum -a 256 uninorm-macos-universal.zip | cut -d' ' -f1)
+          SHA_LINUX_X86=$(shasum -a 256 uninorm-linux-x86_64.tar.gz | cut -d' ' -f1)
+          SHA_LINUX_ARM=$(shasum -a 256 uninorm-linux-aarch64.tar.gz | cut -d' ' -f1)
+          TAG=${GITHUB_REF_NAME}
 
           git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/uninorm/homebrew-uninorm.git" tap-repo
+          cat > tap-repo/Formula/uninorm.rb <<EOF
+          class Uninorm < Formula
+            desc "Unicode NFD→NFC normalization — CLI (cross-platform)"
+            homepage "https://github.com/uninorm/uninorm"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              url "https://github.com/uninorm/uninorm/releases/download/$TAG/uninorm-macos-universal.zip"
+              sha256 "$SHA_MACOS"
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/uninorm/uninorm/releases/download/$TAG/uninorm-linux-aarch64.tar.gz"
+                sha256 "$SHA_LINUX_ARM"
+              end
+              on_intel do
+                url "https://github.com/uninorm/uninorm/releases/download/$TAG/uninorm-linux-x86_64.tar.gz"
+                sha256 "$SHA_LINUX_X86"
+              end
+            end
+
+            def install
+              bin.install "uninorm"
+            end
+
+            test do
+              system "#{bin}/uninorm", "--version"
+            end
+          end
+          EOF
+
           cd tap-repo
+          git config user.email "github-actions@github.com"
+          git config user.name "GitHub Actions"
+          git diff --exit-code || git commit -am "Bump uninorm to $TAG"
+          git push
 
-          sed -i '' "s|url \".*\"|url \"${URL}\"|" Formula/uninorm.rb
-          sed -i '' "s|sha256 \".*\"|sha256 \"${SHA}\"|" Formula/uninorm.rb
-          sed -i '' "s|version \".*\"|version \"${VERSION}\"|" Formula/uninorm.rb
+      # ── Update Scoop bucket ──────────────────────────────────────────
+      - name: Update Scoop manifest
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          SHA_WIN=$(shasum -a 256 uninorm-windows-x86_64.zip | cut -d' ' -f1)
+          TAG=${GITHUB_REF_NAME}
 
-          if ! grep -qF "url \"${URL}\"" Formula/uninorm.rb || \
-             ! grep -qF "sha256 \"${SHA}\"" Formula/uninorm.rb || \
-             ! grep -qF "version \"${VERSION}\"" Formula/uninorm.rb; then
-            echo "::error::Formula update failed: sed did not replace expected patterns (check quote style and key names in Formula/uninorm.rb)"
-            exit 1
-          fi
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/uninorm/scoop-uninorm.git" scoop-repo
+          cd scoop-repo
+          mkdir -p bucket
+
+          cat > bucket/uninorm.json <<EOF
+          {
+              "version": "$VERSION",
+              "description": "Unicode NFD to NFC normalization CLI (cross-platform)",
+              "homepage": "https://github.com/uninorm/uninorm",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/uninorm/uninorm/releases/download/$TAG/uninorm-windows-x86_64.zip",
+                      "hash": "$SHA_WIN"
+                  }
+              },
+              "bin": "uninorm.exe",
+              "checkver": {
+                  "github": "https://github.com/uninorm/uninorm"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/uninorm/uninorm/releases/download/v\$version/uninorm-windows-x86_64.zip"
+                      }
+                  }
+              }
+          }
+          EOF
 
           git config user.email "github-actions@github.com"
           git config user.name "GitHub Actions"
-          git commit -am "Bump uninorm to ${GITHUB_REF_NAME}"
+          git add -A
+          git diff --cached --exit-code || git commit -m "Bump uninorm to $TAG"
           git push

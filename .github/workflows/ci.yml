@@ -7,11 +7,17 @@ on:
       - "*.md"
       - "docs/**"
       - "LICENSE"
+      - ".github/workflows/release.yml"
+      - "Cross.toml"
+      - "Makefile"
   pull_request:
     paths-ignore:
       - "*.md"
       - "docs/**"
       - "LICENSE"
+      - ".github/workflows/release.yml"
+      - "Cross.toml"
+      - "Makefile"
 
 jobs:
   test:
