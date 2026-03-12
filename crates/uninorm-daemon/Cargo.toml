@@ -1,0 +1,28 @@
+[package]
+name = "uninorm-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "Daemon and configuration management for uninorm"
+license = "MIT"
+repository = "https://github.com/uninorm/uninorm"
+keywords = ["unicode", "nfc", "nfd", "daemon", "watcher"]
+categories = ["filesystem"]
+
+[dependencies]
+uninorm-core = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+globset = { workspace = true }
+walkdir = { workspace = true }
+notify = "8"
+dirs = "6"
+chrono = { version = "0.4", features = ["clock"] }
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

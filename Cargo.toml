@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "crates/uninorm-core",
+    "crates/uninorm-daemon",
     "crates/uninorm-cli",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 uninorm-core = { path = "crates/uninorm-core" }
+uninorm-daemon = { path = "crates/uninorm-daemon" }
 unicode-normalization = "0.1.25"
 hfs_nfd = "2.0.0"   # only linked on macOS via target cfg in uninorm-core
 walkdir = "2.5.0"

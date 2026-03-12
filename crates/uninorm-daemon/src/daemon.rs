@@ -2,15 +2,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::Result;
-
 use crate::config::{self, WatchConfig};
+use crate::error::DaemonError;
 
 /// Maximum log file size before rotation (5 MB).
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
+/// Maximum number of pending events before dropping new ones.
+const MAX_PENDING: usize = 10_000;
+
 /// Spawn the daemon as a detached background process.
-pub fn spawn_daemon() -> Result<()> {
+pub fn spawn_daemon() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
 
     #[cfg(unix)]
@@ -46,7 +48,7 @@ pub fn spawn_daemon() -> Result<()> {
 }
 
 /// Append a timestamped log entry, with size-based rotation.
-fn append_log(message: &str) {
+pub fn append_log(message: &str) {
     let Ok(path) = config::log_path() else {
         return;
     };
@@ -82,8 +84,8 @@ fn is_temp_file(name: &str) -> bool {
 }
 
 /// Clean up stale temp files left by a previous crash.
-fn cleanup_stale_temps(config: &WatchConfig) {
-    for entry in &config.entries {
+fn cleanup_stale_temps(wc: &WatchConfig) {
+    for entry in &wc.entries {
         let walker = walkdir::WalkDir::new(&entry.path).max_depth(if entry.recursive {
             usize::MAX
         } else {
@@ -109,13 +111,13 @@ struct CompiledEntry<'a> {
     globs: globset::GlobSet,
 }
 
-/// Lightweight view for use inside `spawn_blocking` closures.
+/// Lightweight view for use inside spawn_blocking closures.
 struct InlineCompiledEntry<'a> {
     entry_path: &'a Path,
     globs: &'a globset::GlobSet,
 }
 
-/// Rename variant that works with `InlineCompiledEntry` (for spawn_blocking).
+/// Rename variant that works with InlineCompiledEntry (for spawn_blocking).
 fn rename_if_needed_inline(
     path: &Path,
     ce: &InlineCompiledEntry<'_>,
@@ -154,7 +156,7 @@ fn rename_if_needed_inline(
     match std::fs::rename(path, &tmp) {
         Ok(_) => match std::fs::rename(&tmp, &new_path) {
             Ok(_) => (
-                Some(format!("Renamed: {} → {}", file_name, nfc_name)),
+                Some(format!("Renamed: {file_name} -> {nfc_name}")),
                 Some(new_path),
             ),
             Err(e) => {
@@ -200,14 +202,10 @@ fn convert_content_if_needed(path: &Path, max_bytes: u64) -> Option<String> {
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        // Binary or non-UTF8 files — silently skip (not an error)
         Err(ref e) if e.kind() == std::io::ErrorKind::InvalidData => return None,
         Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            return Some(format!(
-                "Error: cannot read {}: {e}",
-                path.display()
-            ));
+            return Some(format!("Error: cannot read {}: {e}", path.display()));
         }
     };
 
@@ -257,8 +255,8 @@ impl Drop for PidGuard {
     }
 }
 
-/// Main daemon loop. Called by the hidden `daemon` subcommand.
-pub async fn run_daemon() -> Result<()> {
+/// Main daemon loop. Called by the hidden daemon subcommand.
+pub async fn run_daemon() -> std::result::Result<(), DaemonError> {
     config::write_pid(std::process::id())?;
     let _pid_guard = PidGuard;
     append_log("Daemon started");
@@ -267,7 +265,7 @@ pub async fn run_daemon() -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn run_daemon_platform() -> Result<()> {
+async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
     use notify::Watcher;
     use tokio::sync::mpsc;
 
@@ -277,9 +275,8 @@ async fn run_daemon_platform() -> Result<()> {
     // Outer loop: reload config on SIGHUP
     loop {
         let watch_config = WatchConfig::load()?;
-        let has_enabled = watch_config.entries.iter().any(|e| e.enabled);
-        if !has_enabled {
-            append_log("No enabled watch entries — daemon exiting");
+        if watch_config.enabled_count() == 0 {
+            append_log("No enabled watch entries -- daemon exiting");
             return Ok(());
         }
 
@@ -287,8 +284,7 @@ async fn run_daemon_platform() -> Result<()> {
 
         {
             let cfg_ref = watch_config.clone();
-            tokio::task::spawn_blocking(move || cleanup_stale_temps(&cfg_ref))
-                .await?;
+            tokio::task::spawn_blocking(move || cleanup_stale_temps(&cfg_ref)).await?;
         }
 
         // Pre-compile glob sets for enabled entries only
@@ -334,17 +330,15 @@ async fn run_daemon_platform() -> Result<()> {
         }
 
         if watch_ok == 0 {
-            append_log("All watch paths failed — daemon exiting");
-            return Ok(());
+            append_log("All watch paths failed -- daemon exiting");
+            return Err(DaemonError::AllWatchesFailed);
         }
 
         // Inner loop: process events with debounce
-        const MAX_PENDING: usize = 10_000;
-        let mut pending_paths: HashMap<PathBuf, bool> = HashMap::new(); // path -> is_name_event
+        let mut pending_paths: HashMap<PathBuf, bool> = HashMap::new();
         let debounce_dur = std::time::Duration::from_millis(debounce_ms);
         let mut debounce_timer = tokio::time::interval(debounce_dur);
         debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Skip the first immediate tick
         debounce_timer.tick().await;
 
         loop {
@@ -374,7 +368,6 @@ async fn run_daemon_platform() -> Result<()> {
                                 {
                                     continue;
                                 }
-                                // Merge: if we already have a name event, keep it
                                 if pending_paths.len() >= MAX_PENDING && !pending_paths.contains_key(&path) {
                                     append_log("Warning: pending event queue full, dropping event");
                                     continue;
@@ -393,8 +386,6 @@ async fn run_daemon_platform() -> Result<()> {
 
                     let batch = std::mem::take(&mut pending_paths);
 
-                    // Run blocking file I/O on the blocking thread pool
-                    // to avoid starving the async event loop.
                     let compiled_ref = &compiled;
                     for (path, is_name_event) in &batch {
                         let Some(ce) = find_entry_for_path(path, compiled_ref) else {
@@ -413,7 +404,6 @@ async fn run_daemon_platform() -> Result<()> {
                         let messages = tokio::task::spawn_blocking(move || {
                             let mut msgs = Vec::new();
 
-                            // Skip symlinks unless follow_symlinks is enabled
                             if !follow_symlinks {
                                 if let Ok(m) = std::fs::symlink_metadata(&path) {
                                     if m.file_type().is_symlink() {
@@ -422,7 +412,6 @@ async fn run_daemon_platform() -> Result<()> {
                                 }
                             }
 
-                            // Rename on create/name events
                             let nfc_path = if is_name {
                                 let ce_inline = InlineCompiledEntry { entry_path: &entry_path, globs: &globs };
                                 let (msg, renamed_path) = rename_if_needed_inline(&path, &ce_inline);
@@ -434,7 +423,6 @@ async fn run_daemon_platform() -> Result<()> {
                                 None
                             };
 
-                            // Convert content if enabled and not excluded
                             if content_enabled {
                                 let target = nfc_path.as_deref().unwrap_or(&path);
                                 if !uninorm_core::is_excluded(target, &entry_path, &globs) {
@@ -453,7 +441,7 @@ async fn run_daemon_platform() -> Result<()> {
                     }
                 }
                 _ = sighup.recv() => {
-                    append_log("Received SIGHUP — reloading config");
+                    append_log("Received SIGHUP -- reloading config");
                     break;
                 }
                 _ = sigterm.recv() => {
@@ -471,9 +459,6 @@ async fn run_daemon_platform() -> Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn run_daemon_platform() -> Result<()> {
-    anyhow::bail!(
-        "Background watch daemon is only available on macOS.\n\
-         Use `uninorm files <path>` to batch-convert NFD filenames."
-    );
+async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
+    Err(DaemonError::UnsupportedPlatform)
 }

@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
+
+use crate::error::ConfigError;
+
+pub type Result<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchEntry {
@@ -40,20 +43,32 @@ impl WatchConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(&path).map_err(|e| ConfigError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
         Ok(serde_json::from_str(&content)?)
     }
 
     pub fn save(&self) -> Result<()> {
         let path = config_path()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
         }
         // Atomic write: tmp → rename
         let tmp = path.with_extension("json.tmp");
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, &path)?;
+        std::fs::write(&tmp, content).map_err(|e| ConfigError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|e| ConfigError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
         Ok(())
     }
 
@@ -74,12 +89,17 @@ impl WatchConfig {
         self.entries.retain(|e| e.path != path);
         self.entries.len() < len
     }
+
+    /// Count of enabled entries.
+    pub fn enabled_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.enabled).count()
+    }
 }
 
 fn config_dir() -> Result<PathBuf> {
     dirs::config_dir()
         .map(|d| d.join("uninorm"))
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))
+        .ok_or(ConfigError::NoConfigDir)
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -103,9 +123,15 @@ pub fn read_pid() -> Option<u32> {
 pub fn write_pid(pid: u32) -> Result<()> {
     let path = pid_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
-    std::fs::write(&path, pid.to_string())?;
+    std::fs::write(&path, pid.to_string()).map_err(|e| ConfigError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
     Ok(())
 }
 
@@ -138,7 +164,6 @@ fn is_our_daemon(pid: u32) -> bool {
         return false;
     }
     // Second check: verify the process is our daemon binary.
-    // On macOS, use proc_pidpath; on Linux, read /proc/pid/exe.
     #[cfg(target_os = "macos")]
     {
         let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
@@ -449,7 +474,6 @@ mod tests {
 
     #[test]
     fn test_serde_enabled_defaults_to_true() {
-        // Old config without "enabled" field should default to true
         let json = r#"{"entries": [{"path": "/tmp/old"}]}"#;
         let cfg: WatchConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.entries[0].enabled);
@@ -464,5 +488,29 @@ mod tests {
         let json2 = r#"{"entries": []}"#;
         let cfg2: WatchConfig = serde_json::from_str(json2).unwrap();
         assert_eq!(cfg2.debounce_ms, None);
+    }
+
+    #[test]
+    fn test_enabled_count() {
+        let mut cfg = WatchConfig::default();
+        cfg.add_entry(WatchEntry {
+            path: "/tmp/a".into(),
+            recursive: true,
+            content: false,
+            follow_symlinks: false,
+            exclude: vec![],
+            max_content_bytes: None,
+            enabled: true,
+        });
+        cfg.add_entry(WatchEntry {
+            path: "/tmp/b".into(),
+            recursive: true,
+            content: false,
+            follow_symlinks: false,
+            exclude: vec![],
+            max_content_bytes: None,
+            enabled: false,
+        });
+        assert_eq!(cfg.enabled_count(), 1);
     }
 }

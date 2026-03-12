@@ -1177,33 +1177,45 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
- "chrono",
  "clap",
- "dirs",
- "globset",
  "indicatif",
  "libc",
- "notify",
- "serde",
- "serde_json",
- "tempfile",
  "tokio",
  "uninorm-core",
- "walkdir",
+ "uninorm-daemon",
 ]
 
 [[package]]
 name = "uninorm-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "futures",
  "globset",
  "hfs_nfd",
  "serde",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "unicode-normalization",
+ "walkdir",
+]
+
+[[package]]
+name = "uninorm-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "globset",
+ "libc",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uninorm-core",
  "walkdir",
 ]
 

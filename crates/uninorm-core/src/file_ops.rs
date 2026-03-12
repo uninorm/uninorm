@@ -1,5 +1,5 @@
+use crate::error::ConvertError;
 use crate::normalize::{needs_filename_conversion, to_nfc, to_nfc_filename};
-use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 #[cfg(feature = "serde")]
@@ -151,7 +151,7 @@ pub async fn convert_path(
     path: &Path,
     opts: &ConversionOptions,
     mut progress: impl FnMut(&ConversionStats),
-) -> Result<ConversionStats> {
+) -> Result<ConversionStats, ConvertError> {
     let mut stats = ConversionStats::default();
     let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
     for pat in &invalid_patterns {

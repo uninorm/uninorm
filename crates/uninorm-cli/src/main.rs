@@ -1,6 +1,3 @@
-use uninorm_cli::config;
-use uninorm_cli::daemon;
-
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -8,11 +5,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use uninorm_core::{ConversionOptions, ConversionStats, DEFAULT_MAX_CONTENT_BYTES};
+use uninorm_daemon::{config, DaemonController, DaemonError};
 
 #[derive(Parser)]
 #[command(
     name = "uninorm",
-    about = "Convert Unicode NFD → NFC for filenames and text content",
+    about = "Convert Unicode NFD -> NFC for filenames and text content",
     version
 )]
 struct Cli {
@@ -83,6 +81,16 @@ enum Commands {
     Check {
         /// Text to check
         text: String,
+    },
+
+    /// Convert TEXT from NFD to NFC and print the result
+    Convert {
+        /// Text to convert
+        text: String,
+
+        /// Copy result to clipboard
+        #[arg(short = 'c', long)]
+        clipboard: bool,
     },
 
     /// Internal: run as background daemon
@@ -157,7 +165,7 @@ enum WatchAction {
     },
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers --
 
 /// Parse comma-separated 1-based indices (e.g. "1,3,5") and validate against entry count.
 /// Returns sorted, deduplicated 0-based indices.
@@ -176,7 +184,7 @@ fn parse_indices(s: &str, count: usize) -> Result<Vec<usize>> {
                 "Entry #{n} does not exist. Use `uninorm watch list` to see entries (1-{count})."
             );
         }
-        indices.push(n - 1); // convert to 0-based
+        indices.push(n - 1);
     }
     indices.sort_unstable();
     indices.dedup();
@@ -261,14 +269,37 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-// ── Entry point ──────────────────────────────────────────────────────────────
+/// Read the last N lines from a file without loading the entire file.
+fn read_tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+
+    let chunk_size = 64 * 1024u64;
+    let start_pos = file_len.saturating_sub(chunk_size);
+    file.seek(SeekFrom::Start(start_pos))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+
+    let all_lines: Vec<&str> = buf.lines().collect();
+    // If we seeked into the middle, the first line may be partial
+    let tail = if start_pos > 0 && all_lines.len() > 1 {
+        &all_lines[1..]
+    } else {
+        &all_lines[..]
+    };
+    let start = tail.len().saturating_sub(n);
+    Ok(tail[start..].iter().map(|s| s.to_string()).collect())
+}
+
+// -- Entry point --
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        // ── files: batch convert ─────────────────────────────────────
+        // -- files: batch convert --
         Commands::Files {
             path,
             dry_run,
@@ -314,7 +345,7 @@ async fn main() -> Result<()> {
             }
 
             if scan.affected_count() == 0 {
-                println!("No NFD entries found — nothing to do.");
+                println!("No NFD entries found -- nothing to do.");
                 return Ok(());
             }
 
@@ -334,7 +365,7 @@ async fn main() -> Result<()> {
                     if entry.needs_rename {
                         let old = entry.path.file_name().unwrap_or_default().to_string_lossy();
                         let new = entry.new_name.as_deref().unwrap_or("?");
-                        println!("  rename: {} → {}", old, new);
+                        println!("  rename: {} -> {}", old, new);
                     }
                     if entry.needs_content_conversion {
                         println!("  content: {}", entry.path.display());
@@ -370,7 +401,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── watch: manage watch entries and daemon ─────────────────
+        // -- watch: manage watch entries and daemon --
         Commands::Watch { action } => match action {
             WatchAction::Add {
                 path,
@@ -409,9 +440,8 @@ async fn main() -> Result<()> {
                     println!("Updated: {}", canonical.display());
                 }
 
-                #[cfg(unix)]
-                if config::is_daemon_running() {
-                    config::signal_daemon(libc::SIGHUP);
+                if DaemonController::status().is_some() {
+                    let _ = DaemonController::reload();
                     println!("Daemon notified to reload config.");
                 }
             }
@@ -420,23 +450,13 @@ async fn main() -> Result<()> {
                 let mut cfg = config::WatchConfig::load()?;
                 let to_remove = parse_indices(&indices, cfg.entries.len())?;
 
-                // Remove in reverse order to keep indices valid
                 for &idx in to_remove.iter().rev() {
                     let removed = cfg.entries.remove(idx);
                     println!("Removed #{}: {}", idx + 1, removed.path.display());
                 }
                 cfg.save()?;
 
-                #[cfg(unix)]
-                if config::is_daemon_running() {
-                    if cfg.entries.iter().any(|e| e.enabled) {
-                        config::signal_daemon(libc::SIGHUP);
-                        println!("Daemon notified to reload config.");
-                    } else {
-                        config::signal_daemon(libc::SIGTERM);
-                        println!("Daemon stopped (no enabled entries).");
-                    }
-                }
+                let _ = DaemonController::reload_or_stop();
             }
 
             WatchAction::List => {
@@ -489,11 +509,7 @@ async fn main() -> Result<()> {
                 }
                 cfg.save()?;
 
-                #[cfg(unix)]
-                if config::is_daemon_running() {
-                    config::signal_daemon(libc::SIGHUP);
-                    println!("Daemon notified to reload config.");
-                }
+                let _ = DaemonController::reload();
             }
 
             WatchAction::Disable { indices } => {
@@ -506,70 +522,47 @@ async fn main() -> Result<()> {
                 }
                 cfg.save()?;
 
-                #[cfg(unix)]
-                if config::is_daemon_running() {
-                    config::signal_daemon(libc::SIGHUP);
-                    println!("Daemon notified to reload config.");
-                }
+                let _ = DaemonController::reload();
             }
 
             WatchAction::Start => {
-                let cfg = config::WatchConfig::load()?;
-                let enabled_count = cfg.entries.iter().filter(|e| e.enabled).count();
-
-                if enabled_count == 0 {
-                    println!("No enabled watch entries.");
-                    println!("Add one with: uninorm watch add <path>");
-                    return Ok(());
-                }
-
-                #[cfg(unix)]
-                {
-                    if config::is_daemon_running() {
-                        println!(
-                            "Daemon already running (PID {}).",
-                            config::read_pid().unwrap_or(0)
-                        );
-                    } else {
-                        daemon::spawn_daemon()?;
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        if config::is_daemon_running() {
-                            println!("Daemon started (PID {}).", config::read_pid().unwrap_or(0));
-                            println!("\nWatching ({enabled_count} entries):");
-                            for entry in cfg.entries.iter().filter(|e| e.enabled) {
-                                println!("  {}", entry.path.display());
-                            }
-                        } else {
-                            eprintln!(
-                                "Warning: daemon may not have started. Check `uninorm status`."
-                            );
+                match DaemonController::start() {
+                    Ok(pid) => {
+                        println!("Daemon started (PID {pid}).");
+                        let cfg = config::WatchConfig::load()?;
+                        let enabled_count = cfg.enabled_count();
+                        println!("\nWatching ({enabled_count} entries):");
+                        for entry in cfg.entries.iter().filter(|e| e.enabled) {
+                            println!("  {}", entry.path.display());
                         }
                     }
-                }
-                #[cfg(not(unix))]
-                {
-                    eprintln!("Background watch daemon is only available on macOS.");
-                    eprintln!();
-                    eprintln!("On Windows/Linux, use `uninorm files <path>` to batch-convert");
-                    eprintln!("NFD filenames (e.g. files synced from iCloud or macOS).");
-                    std::process::exit(1);
+                    Err(DaemonError::AlreadyRunning { pid }) => {
+                        println!("Daemon already running (PID {pid}).");
+                    }
+                    Err(DaemonError::NoEnabledEntries) => {
+                        println!("No enabled watch entries.");
+                        println!("Add one with: uninorm watch add <path>");
+                    }
+                    Err(DaemonError::UnsupportedPlatform) => {
+                        eprintln!("Background watch daemon is only available on macOS.");
+                        eprintln!();
+                        eprintln!("On Windows/Linux, use `uninorm files <path>` to batch-convert");
+                        eprintln!("NFD filenames (e.g. files synced from iCloud or macOS).");
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
 
             WatchAction::Stop => {
-                #[cfg(unix)]
-                {
-                    if config::is_daemon_running() {
-                        config::signal_daemon(libc::SIGTERM);
-                        println!("Daemon stopped.");
-                    } else {
-                        println!("Daemon is not running.");
+                match DaemonController::stop() {
+                    Ok(()) => println!("Daemon stopped."),
+                    Err(DaemonError::NotRunning) => println!("Daemon is not running."),
+                    Err(DaemonError::UnsupportedPlatform) => {
+                        eprintln!("Background watch daemon is only available on macOS.");
+                        eprintln!("Use `uninorm files <path>` to batch-convert NFD filenames.");
                     }
-                }
-                #[cfg(not(unix))]
-                {
-                    eprintln!("Background watch daemon is only available on macOS.");
-                    eprintln!("Use `uninorm files <path>` to batch-convert NFD filenames.");
+                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -590,78 +583,49 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let path = config::config_path()?;
-                std::fs::remove_file(&path)?;
+                DaemonController::reset()?;
                 println!("All watch entries removed.");
-
-                #[cfg(unix)]
-                if config::is_daemon_running() {
-                    config::signal_daemon(libc::SIGTERM);
-                    println!("Daemon stopped.");
-                }
             }
         },
 
-        // ── log: show recent entries ─────────────────────────────────
+        // -- log: show recent entries --
         Commands::Log { lines } => {
             let path = config::log_path()?;
 
             if !path.exists() {
-                println!("No log file yet. Run `uninorm watch <path>` to start.");
+                println!("No log file yet. Run `uninorm watch add <path>` to start.");
                 println!("Log location: {}", path.display());
                 return Ok(());
             }
 
-            // Read from the end of the file to avoid loading the entire log into memory.
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&path)?;
-            let file_len = file.metadata()?.len();
-
-            // Read a reasonable tail chunk (64KB should hold many lines)
-            let chunk_size = 64 * 1024u64;
-            let start_pos = file_len.saturating_sub(chunk_size);
-            file.seek(SeekFrom::Start(start_pos))?;
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-
-            let all_lines: Vec<&str> = buf.lines().collect();
-            // If we seeked into the middle, the first line may be partial — skip it
-            let tail = if start_pos > 0 && all_lines.len() > 1 {
-                &all_lines[1..]
-            } else {
-                &all_lines[..]
-            };
-            let start = tail.len().saturating_sub(lines);
-            for line in &tail[start..] {
-                println!("{line}");
-            }
+            let tail = read_tail_lines(&path, lines)?;
             if tail.is_empty() {
                 println!("Log is empty.");
             } else {
-                println!(
-                    "\n(showing last {})",
-                    lines.min(tail.len())
-                );
+                for line in &tail {
+                    println!("{line}");
+                }
+                println!("\n(showing last {})", tail.len());
             }
         }
 
-        // ── status: show daemon status + summary ─────────────────────
+        // -- status: show daemon status + summary --
         Commands::Status => {
-            let running = config::is_daemon_running();
-            if let Some(pid) = config::read_pid() {
-                if running {
-                    println!("Daemon running (PID {pid})");
-                } else {
-                    println!("Daemon not running (stale PID {pid})");
-                    config::remove_pid();
+            match DaemonController::status() {
+                Some(pid) => println!("Daemon running (PID {pid})"),
+                None => {
+                    if let Some(pid) = config::read_pid() {
+                        println!("Daemon not running (stale PID {pid})");
+                        config::remove_pid();
+                    } else {
+                        println!("Daemon not running.");
+                    }
                 }
-            } else {
-                println!("Daemon not running.");
             }
 
             let cfg = config::WatchConfig::load()?;
             let total = cfg.entries.len();
-            let enabled = cfg.entries.iter().filter(|e| e.enabled).count();
+            let enabled = cfg.enabled_count();
             if total > 0 {
                 println!("Watch entries: {enabled}/{total} enabled");
                 println!("Use `uninorm watch list` for details.");
@@ -669,26 +633,14 @@ async fn main() -> Result<()> {
                 println!("No watch entries configured.");
             }
 
-            // Show last 5 log lines (read only the tail to avoid loading entire file)
+            // Show last 5 log lines
             if let Ok(log) = config::log_path() {
                 if log.exists() {
-                    if let Ok(mut file) = std::fs::File::open(&log) {
-                        use std::io::{Read, Seek, SeekFrom};
-                        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                        let chunk_size = 4 * 1024u64; // 4KB is plenty for 5 lines
-                        let start_pos = file_len.saturating_sub(chunk_size);
-                        let _ = file.seek(SeekFrom::Start(start_pos));
-                        let mut buf = String::new();
-                        if file.read_to_string(&mut buf).is_ok() {
-                            let all: Vec<&str> = buf.lines().collect();
-                            let skip_first = if start_pos > 0 && !all.is_empty() { 1 } else { 0 };
-                            let tail = &all[skip_first..];
-                            let recent = &tail[tail.len().saturating_sub(5)..];
-                            if !recent.is_empty() {
-                                println!("\nRecent activity:");
-                                for l in recent {
-                                    println!("  {l}");
-                                }
+                    if let Ok(recent) = read_tail_lines(&log, 5) {
+                        if !recent.is_empty() {
+                            println!("\nRecent activity:");
+                            for l in &recent {
+                                println!("  {l}");
                             }
                         }
                     }
@@ -696,7 +648,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── clipboard ────────────────────────────────────────────────
+        // -- clipboard --
         Commands::Clipboard => {
             let mut clipboard = arboard::Clipboard::new()
                 .map_err(|e| anyhow::anyhow!("Failed to open clipboard: {e}"))?;
@@ -708,7 +660,7 @@ async fn main() -> Result<()> {
             let nfc = uninorm_core::convert_text(&text);
 
             if nfc == text {
-                println!("Clipboard is already NFC — no changes made.");
+                println!("Clipboard is already NFC -- no changes made.");
             } else {
                 clipboard
                     .set_text(nfc)
@@ -717,20 +669,40 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── check ────────────────────────────────────────────────────
+        // -- check --
         Commands::Check { text } => {
             if uninorm_core::is_nfc(&text) {
-                println!("✓ Already NFC");
+                println!("Already NFC");
             } else {
                 let nfc = uninorm_core::convert_text(&text);
-                println!("✗ NOT NFC — converted form: {nfc}");
+                println!("NOT NFC -- converted form: {nfc}");
                 std::process::exit(1);
             }
         }
 
-        // ── daemon (hidden, internal) ────────────────────────────────
+        // -- convert --
+        Commands::Convert { text, clipboard } => {
+            let nfc = uninorm_core::convert_text(&text);
+
+            if nfc == text {
+                println!("{nfc}");
+                eprintln!("(already NFC)");
+            } else {
+                println!("{nfc}");
+            }
+
+            if clipboard {
+                let mut cb = arboard::Clipboard::new()
+                    .map_err(|e| anyhow::anyhow!("Failed to open clipboard: {e}"))?;
+                cb.set_text(&nfc)
+                    .map_err(|e| anyhow::anyhow!("Failed to write clipboard: {e}"))?;
+                eprintln!("(copied to clipboard)");
+            }
+        }
+
+        // -- daemon (hidden, internal) --
         Commands::Daemon => {
-            daemon::run_daemon().await?;
+            uninorm_daemon::daemon::run_daemon().await?;
         }
     }
 
