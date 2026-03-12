@@ -1402,19 +1402,36 @@ mod tests {
 
     // ── Symlinks: not followed by default ─────────────────────────────────────
 
+    /// Try to create a directory symlink. Returns Ok on success, Err if
+    /// the OS doesn't support it (e.g. Windows without Developer Mode).
+    fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlinks not supported on this platform",
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn test_symlinks_not_followed_by_default() {
         let dir = TempDir::new().unwrap();
         let target_dir = TempDir::new().unwrap();
-        // Write an NFD-content file in the target.
         fs::write(target_dir.path().join("linked.txt"), "e\u{0301}").unwrap();
-        // Symlink inside dir pointing to target_dir.
+
         let link = dir.path().join("link");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(target_dir.path(), &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // Symlink test only meaningful on Unix; skip silently on Windows.
+        if try_symlink_dir(target_dir.path(), &link).is_err() {
+            // Skip: symlink not available (e.g. Windows without Developer Mode)
             return;
         }
 
