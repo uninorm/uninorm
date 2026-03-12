@@ -576,14 +576,14 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                if !yes {
-                    if !confirm(&format!(
+                if !yes
+                    && !confirm(&format!(
                         "Remove all {} watch entries?",
                         cfg.entries.len()
-                    )) {
-                        println!("Cancelled.");
-                        return Ok(());
-                    }
+                    ))
+                {
+                    println!("Cancelled.");
+                    return Ok(());
                 }
 
                 let path = config::config_path()?;
