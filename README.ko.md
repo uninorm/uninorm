@@ -4,7 +4,7 @@ Unicode NFD 파일명과 텍스트를 NFC로 변환합니다 — macOS, Linux, W
 
 macOS HFS+/APFS는 파일명을 비표준 NFD로 저장해서, 한글·일본어 카나·라틴 악센트 문자가 Linux/Windows에서 깨집니다.
 
-> English: [README.md](README.md)
+[English](README.md) | 한국어
 
 ---
 
@@ -42,6 +42,9 @@ uninorm clipboard
 
 # NFC 여부 확인 (비NFC면 exit 1)
 uninorm check "東京"
+
+# 텍스트 NFD → NFC 변환 (텍스트 생략 시 stdin에서 읽기)
+echo "NFD 텍스트" | uninorm convert
 ```
 
 ---
@@ -65,14 +68,12 @@ uninorm files <경로> [옵션]
 
 ---
 
-## `watch` — 백그라운드 데몬
+## `watch` — 감시 항목 관리
 
-감시 항목을 관리하고, 파일이 생성/수정될 때 자동으로 변환하는 백그라운드 데몬을 실행합니다.
-
-### 감시 항목 관리
+백그라운드 데몬의 감시 항목을 관리합니다. 파일이 생성/수정될 때 자동으로 변환됩니다.
 
 ```bash
-# 감시 경로 추가
+# 감시 경로 추가 (데몬 자동 시작)
 uninorm watch add ~/Downloads
 uninorm watch add ~/Documents --content --exclude .git --exclude "*.log" --max-size 200MB
 
@@ -88,15 +89,8 @@ uninorm watch disable 2
 # 번호로 삭제
 uninorm watch remove 1
 
-# 전체 초기화
+# 전체 초기화 및 데몬 중지 (autostart는 유지됨)
 uninorm watch reset
-```
-
-### 데몬 시작/중지
-
-```bash
-uninorm watch start        # 데몬 시작 (활성화된 항목만 감시)
-uninorm watch stop         # 데몬 중지
 ```
 
 ### 감시 항목 옵션
@@ -112,12 +106,38 @@ uninorm watch stop         # 데몬 중지
 
 ---
 
+## `daemon` — 백그라운드 데몬 관리
+
+```bash
+uninorm daemon start       # 데몬 시작
+uninorm daemon stop        # 데몬 중지
+uninorm daemon restart     # 데몬 재시작
+```
+
+---
+
+## `autostart` — 로그인 시 자동 시작
+
+데몬이 로그인 시 자동으로 시작되도록 등록/해제합니다 (macOS: LaunchAgent, Linux: systemd).
+
+```bash
+uninorm autostart on       # 자동 시작 활성화
+uninorm autostart off      # 자동 시작 비활성화
+```
+
+`uninorm` 명령어를 처음 실행하면 자동으로 autostart가 등록됩니다. `watch reset`은 autostart를 제거하지 않습니다 — 명시적으로 비활성화하려면 `uninorm autostart off`를 사용하세요.
+
+---
+
 ## 기타 명령어
 
 ```bash
+uninorm convert "텍스트"    # 텍스트 NFD → NFC 변환
+echo "텍스트" | uninorm convert  # stdin에서 읽기
+uninorm convert -c "텍스트" # 변환 후 클립보드에 복사
 uninorm clipboard          # 클립보드 텍스트 NFD → NFC 변환
 uninorm check "텍스트"      # 텍스트가 NFC인지 확인
-uninorm status             # 데몬 상태 및 항목 요약
+uninorm status             # 데몬 상태, autostart, 감시 항목 요약
 uninorm log -n 50          # 최근 변환 로그 (마지막 50개)
 ```
 
@@ -138,7 +158,8 @@ macOS는 파일명을 쓸 때 `강` (U+AC15)을 낱자(`ᄀ` + `ᅡ` + `ᆼ`)로
 | 크레이트 | 설명 |
 |---|---|
 | `uninorm-core` | 핵심 라이브러리 — 정규화, 파일 작업, 스캔 |
-| `uninorm-cli` | CLI 바이너리 — `files`, `watch`, `clipboard`, `check` 명령어 |
+| `uninorm-cli` | CLI 바이너리 — `files`, `watch`, `daemon`, `autostart`, `convert`, `clipboard`, `check` |
+| `uninorm-daemon` | 데몬 라이브러리 — 설정, 컨트롤러, 자동 시작, 백그라운드 감시 |
 
 ---
 

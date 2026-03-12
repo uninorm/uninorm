@@ -4,7 +4,7 @@ Converts Unicode NFD filenames and text to NFC — works on macOS, Linux, and Wi
 
 macOS HFS+/APFS stores filenames in a non-standard NFD variant, causing Korean, Japanese kana, and accented Latin characters to appear broken on Linux and Windows.
 
-> 한국어: [README.ko.md](README.ko.md)
+English | [한국어](README.ko.md)
 
 ---
 
@@ -42,6 +42,9 @@ uninorm clipboard
 
 # Check if text is NFC (exits 1 if not)
 uninorm check "東京"
+
+# Convert text from NFD to NFC (reads stdin if no text given)
+echo "NFD text" | uninorm convert
 ```
 
 ---
@@ -65,14 +68,12 @@ uninorm files <path> [options]
 
 ---
 
-## `watch` — background daemon
+## `watch` — manage watch entries
 
-Manage watch entries and run a background daemon that auto-converts files as they are created or modified.
-
-### Managing watch entries
+Manage watch entries for the background daemon. Files are auto-converted as they are created or modified.
 
 ```bash
-# Add a path to watch
+# Add a path to watch (starts daemon automatically)
 uninorm watch add ~/Downloads
 uninorm watch add ~/Documents --content --exclude .git --exclude "*.log" --max-size 200MB
 
@@ -88,15 +89,8 @@ uninorm watch disable 2
 # Remove by number
 uninorm watch remove 1
 
-# Remove all entries
+# Remove all entries and stop daemon (autostart is preserved)
 uninorm watch reset
-```
-
-### Starting and stopping the daemon
-
-```bash
-uninorm watch start        # Start daemon (watches all enabled entries)
-uninorm watch stop         # Stop daemon
 ```
 
 ### Watch entry options
@@ -112,12 +106,38 @@ uninorm watch stop         # Stop daemon
 
 ---
 
+## `daemon` — manage the background daemon
+
+```bash
+uninorm daemon start       # Start the daemon
+uninorm daemon stop        # Stop the daemon
+uninorm daemon restart     # Restart the daemon
+```
+
+---
+
+## `autostart` — login-time auto-start
+
+Register or unregister the daemon to start automatically on login (LaunchAgent on macOS, systemd on Linux).
+
+```bash
+uninorm autostart on       # Enable autostart
+uninorm autostart off      # Disable autostart
+```
+
+Autostart is automatically registered on first run of any `uninorm` command. `watch reset` does not remove autostart — use `uninorm autostart off` to disable it explicitly.
+
+---
+
 ## Other commands
 
 ```bash
+uninorm convert "text"     # Convert text from NFD to NFC
+echo "text" | uninorm convert  # Read from stdin
+uninorm convert -c "text"  # Convert and copy to clipboard
 uninorm clipboard          # Convert clipboard text from NFD to NFC
 uninorm check "text"       # Check if text is already NFC-normalized
-uninorm status             # Show daemon status and entry summary
+uninorm status             # Show daemon status, autostart, and entry summary
 uninorm log -n 50          # Show recent conversion log (last 50 entries)
 ```
 
@@ -138,7 +158,8 @@ macOS decomposes characters like `강` (U+AC15) into separate code points (`ᄀ`
 | Crate | Description |
 |---|---|
 | `uninorm-core` | Core library — normalization, file operations, scanning |
-| `uninorm-cli` | CLI binary — `files`, `watch`, `clipboard`, `check` commands |
+| `uninorm-cli` | CLI binary — `files`, `watch`, `daemon`, `autostart`, `convert`, `clipboard`, `check` |
+| `uninorm-daemon` | Daemon library — config, controller, autostart, background watcher |
 
 ---
 
