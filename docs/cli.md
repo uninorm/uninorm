@@ -1,15 +1,18 @@
 # uninorm CLI Reference
 
-> 한국어: [cli.ko.md](cli.ko.md)
+English | [한국어](cli.ko.md)
 
 ## Subcommands
 
 - [`files`](#files) — Batch rename files/folders (and optionally convert content)
-- [`watch`](#watch) — Real-time watcher: auto-rename files as they appear
-- [`log`](#log) — View recent conversion log
-- [`status`](#status) — Show watcher status (PID, paths, recent activity)
+- [`watch`](#watch) — Manage watch entries for the background daemon
+- [`daemon`](#daemon) — Manage the background daemon (start/stop/restart)
+- [`autostart`](#autostart) — Register daemon to start on login (on/off)
+- [`convert`](#convert) — Convert text from NFD to NFC
 - [`clipboard`](#clipboard) — Convert clipboard text
 - [`check`](#check) — Check if text is NFC-normalized
+- [`log`](#log) — View recent conversion log
+- [`status`](#status) — Show daemon status, autostart, and watch entry summary
 
 ---
 
@@ -18,7 +21,7 @@
 Recursively scan a directory (or a single file) and rename any NFD filenames to NFC. Optionally convert text content inside files.
 
 ```
-uninorm files PATH [OPTIONS]
+uninorm files <PATH> [OPTIONS]
 ```
 
 **Arguments**
@@ -32,16 +35,19 @@ uninorm files PATH [OPTIONS]
 | Flag | Default | Description |
 |---|---|---|
 | `--dry-run` | false | Preview changes without renaming or writing anything |
-| `-r / --recursive` | true | Recurse into subdirectories |
+| `--no-recursive` | false | Do not recurse into subdirectories |
 | `--content` | false | Also convert text content inside files |
 | `--follow-symlinks` | false | Follow symbolic links |
-| `--exclude <PATTERN>` | — | Skip entries whose name matches PATTERN (repeatable) |
+| `--exclude <PATTERN>` | — | Skip entries matching name or glob pattern (repeatable) |
+| `--max-size <SIZE>` | 100MB | Maximum file size for content conversion (e.g. `50MB`, `1GB`) |
+| `-y / --yes` | false | Skip confirmation prompt |
+| `-v / --verbose` | false | Show individual file changes |
 
 **Examples**
 
 ```bash
-# Preview what would change in the current directory
-uninorm files --dry-run
+# Preview what would change
+uninorm files ~/Downloads --dry-run
 
 # Rename all NFD filenames under ~/Downloads
 uninorm files ~/Downloads
@@ -68,7 +74,6 @@ Exit code is `1` if any rename or write error occurred.
 
 **Notes**
 
-- Files larger than 100 MB are skipped for content conversion.
 - Content writes are atomic: written to a temp file first, then renamed into place.
 - `--exclude` matches against the entry's name only (not the full path).
 
@@ -76,136 +81,116 @@ Exit code is `1` if any rename or write error occurred.
 
 ## `watch`
 
-Watch one or more directories and automatically rename files from NFD to NFC as they are created or renamed. Uses the native filesystem event API (FSEvents on macOS, inotify on Linux, ReadDirectoryChanges on Windows).
+Manage watch entries for the background daemon. Files are auto-converted as they are created or modified.
 
 ```
-uninorm watch PATH... [OPTIONS]
+uninorm watch <SUBCOMMAND>
 ```
 
-**Arguments**
+### `watch add`
 
-| Argument | Description |
+Add or update a watch entry. Starts the daemon automatically if not running.
+
+```bash
+uninorm watch add <PATH> [OPTIONS]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--no-recursive` | false | Do not recurse into subdirectories |
+| `--content` | false | Convert text content inside files |
+| `--follow-symlinks` | false | Follow symbolic links |
+| `--exclude <PATTERN>` | — | Skip entries matching name or glob pattern (repeatable) |
+| `--max-size <SIZE>` | 100MB | Maximum file size for content conversion |
+| `--debounce <MS>` | 300 | Event debounce interval in milliseconds |
+
+### `watch list`
+
+Show all watch entries (numbered).
+
+```bash
+uninorm watch list
+#  1. /Users/you/Downloads   [enabled]
+#  2. /Users/you/Documents   [disabled]  (content, excludes: .git, *.log)
+```
+
+### `watch enable` / `watch disable`
+
+Enable or disable entries by number (comma-separated).
+
+```bash
+uninorm watch enable 1,2
+uninorm watch disable 2
+```
+
+### `watch remove`
+
+Remove entries by number (comma-separated).
+
+```bash
+uninorm watch remove 1
+```
+
+### `watch reset`
+
+Remove all watch entries and stop daemon. Autostart is preserved.
+
+```bash
+uninorm watch reset
+uninorm watch reset -y   # skip confirmation
+```
+
+---
+
+## `daemon`
+
+Manage the background daemon process. Similar to `systemctl start/stop`.
+
+```bash
+uninorm daemon start       # Start the daemon
+uninorm daemon stop        # Stop the daemon
+uninorm daemon restart     # Restart the daemon
+```
+
+The daemon watches paths configured via `uninorm watch add` and auto-converts NFD filenames (and optionally content) as filesystem events arrive.
+
+---
+
+## `autostart`
+
+Register or unregister the daemon to start automatically on login. Similar to `systemctl enable/disable`.
+
+- **macOS:** installs a LaunchAgent plist
+- **Linux:** installs a systemd user service
+
+```bash
+uninorm autostart on       # Enable autostart
+uninorm autostart off      # Disable autostart
+```
+
+Autostart is automatically registered on first run of any `uninorm` command. `watch reset` does not remove autostart — use `uninorm autostart off` to disable it explicitly.
+
+---
+
+## `convert`
+
+Convert text from NFD to NFC and print the result. Reads from stdin if no text is given.
+
+```
+uninorm convert [TEXT] [OPTIONS]
+```
+
+| Flag | Description |
 |---|---|
-| `PATH...` | One or more directories to watch — space-separated (required) |
-
-**Options**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--exclude <PATTERN>` | — | Skip entries whose name matches PATTERN (repeatable) |
+| `-c / --clipboard` | Copy result to clipboard |
 
 **Examples**
 
 ```bash
-# Watch the current directory (explicit path required)
-uninorm watch .  # current directory
-
-# Watch multiple paths
-uninorm watch ~/Downloads ~/Desktop
-
-# Watch but skip .git directories
-uninorm watch ~/project --exclude .git
-
-# Run in the background (shell job control)
-uninorm watch ~/Downloads &
+uninorm convert "NFD text"
+echo "NFD text" | uninorm convert
+uninorm convert -c "text"   # convert and copy to clipboard
 ```
-
-**Output**
-
-```
-Watching: /Users/you/Downloads
-Press Ctrl+C to stop.
-
-Renamed: 한글파일.txt → 한글파일.txt
-```
-
-Each conversion is printed to stdout and appended to the log file at `~/.config/uninorm/uninorm.log`.
-
-Press **Ctrl+C** to stop the watcher gracefully.
-
-**Notes**
-
-- APFS on modern macOS normalizes new filenames to NFC, so `watch` will mostly trigger on files copied from external sources (USB drives, network shares, older HFS+ volumes).
-- `watch` does not do a full scan on startup — it only processes new events. Use `uninorm files` first to convert existing NFD filenames.
-
----
-
-## `log`
-
-Show recent entries from the conversion log written by `watch`.
-
-```
-uninorm log [-n N]
-```
-
-**Options**
-
-| Flag | Default | Description |
-|---|---|---|
-| `-n / --lines N` | 50 | Number of recent lines to show |
-
-**Log location:** `~/.config/uninorm/uninorm.log`
-
-**Examples**
-
-```bash
-# Show last 50 log entries (default)
-uninorm log
-
-# Show last 100 entries
-uninorm log -n 100
-
-# Show all entries (pipe through a pager)
-uninorm log -n 99999 | less
-```
-
-**Sample output**
-
-```
-[2024-03-09 14:22:01] Watching: /Users/you/Downloads
-[2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
-[2024-03-09 14:30:02] Watch stopped.
-
-(3 total entries, showing last 3)
-```
-
----
-
-## `status`
-
-Show the current state of the `watch` daemon: whether it is running, its PID, the paths being watched, and the most recent log activity.
-
-```
-uninorm status
-```
-
-**Examples**
-
-```bash
-uninorm status
-```
-
-**Sample output (watcher running)**
-
-```
-Watcher running  (PID 12345, started 2024-03-09 14:22:00)
-
-Watched paths:
-  /Users/you/Downloads
-  /Users/you/Desktop
-
-Recent activity:
-  [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
-  [2024-03-09 14:30:02] Renamed: café.txt → café.txt
-```
-
-**Sample output (no watcher)**
-
-```
-No watcher is running.
-```
-
-The watcher state is stored at `~/.config/uninorm/watch.state` and is written on `watch` start / removed on `Ctrl+C`. Stale state files (process no longer alive) are automatically cleaned up.
 
 ---
 
@@ -225,8 +210,6 @@ uninorm clipboard
 # → "Clipboard is already NFC — no changes made."
 ```
 
-Useful as a post-paste step or bound to a keyboard shortcut.
-
 ---
 
 ## `check`
@@ -234,7 +217,7 @@ Useful as a post-paste step or bound to a keyboard shortcut.
 Check whether a string is already NFC-normalized. Exits with code `1` if it is not.
 
 ```
-uninorm check TEXT
+uninorm check <TEXT>
 ```
 
 **Examples**
@@ -254,15 +237,42 @@ fi
 
 ---
 
-## Log file
+## `log`
 
-`watch` appends timestamped entries to:
+Show recent entries from the conversion log.
 
 ```
-~/.config/uninorm/uninorm.log
+uninorm log [-n N]
 ```
 
-The directory is created automatically on first run.
+| Flag | Default | Description |
+|---|---|---|
+| `-n / --lines N` | 50 | Number of recent lines to show |
+
+**Log location:** `~/.config/uninorm/uninorm.log`
+
+---
+
+## `status`
+
+Show daemon status, autostart state, watch entry summary, and recent log activity.
+
+```
+uninorm status
+```
+
+**Sample output**
+
+```
+Daemon running (PID 12345)
+Autostart: on
+Watch entries: 2/3 enabled
+Use `uninorm watch list` for details.
+
+Recent activity:
+  [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
+  [2024-03-09 14:30:02] Renamed: café.txt → café.txt
+```
 
 ---
 

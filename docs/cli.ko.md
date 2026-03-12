@@ -1,14 +1,18 @@
 # uninorm CLI 레퍼런스
 
-> English: [cli.md](cli.md)
+[English](cli.md) | 한국어
 
 ## 서브커맨드
 
 - [`files`](#files) — 파일/폴더 일괄 변환 (선택적으로 내용 변환 포함)
-- [`watch`](#watch) — 실시간 감시: 파일 생성/이름 변경 시 자동 변환
-- [`log`](#log) — 최근 변환 로그 보기
+- [`watch`](#watch) — 백그라운드 데몬의 감시 항목 관리
+- [`daemon`](#daemon) — 백그라운드 데몬 관리 (start/stop/restart)
+- [`autostart`](#autostart) — 로그인 시 데몬 자동 시작 등록/해제 (on/off)
+- [`convert`](#convert) — 텍스트 NFD → NFC 변환
 - [`clipboard`](#clipboard) — 클립보드 텍스트 변환
 - [`check`](#check) — 텍스트 NFC 여부 확인
+- [`log`](#log) — 최근 변환 로그 보기
+- [`status`](#status) — 데몬 상태, autostart, 감시 항목 요약
 
 ---
 
@@ -17,30 +21,33 @@
 디렉토리(또는 단일 파일)를 재귀적으로 스캔하여 NFD 파일명을 NFC로 변환합니다. 파일 내용도 함께 변환할 수 있습니다.
 
 ```
-uninorm files [PATH] [OPTIONS]
+uninorm files <경로> [옵션]
 ```
 
 **인수**
 
-| 인수 | 기본값 | 설명 |
-|---|---|---|
-| `PATH` | `.` (현재 디렉토리) | 처리할 파일 또는 디렉토리 |
+| 인수 | 설명 |
+|---|---|
+| `경로` | 처리할 파일 또는 디렉토리 (필수) |
 
 **옵션**
 
 | 플래그 | 기본값 | 설명 |
 |---|---|---|
 | `--dry-run` | false | 실제 변경 없이 미리보기만 |
-| `-r / --recursive` | true | 서브디렉토리 재귀 처리 |
+| `--no-recursive` | false | 서브디렉토리 재귀 처리 안함 |
 | `--content` | false | 파일 내용도 변환 |
 | `--follow-symlinks` | false | 심볼릭 링크 추적 |
-| `--exclude <PATTERN>` | — | 이름이 일치하는 항목 제외 (반복 가능) |
+| `--exclude <PATTERN>` | — | 이름 또는 glob 패턴 일치 항목 제외 (반복 가능) |
+| `--max-size <SIZE>` | 100MB | 내용 변환 최대 파일 크기 (예: `50MB`, `1GB`) |
+| `-y / --yes` | false | 확인 프롬프트 건너뛰기 |
+| `-v / --verbose` | false | 개별 파일 변경 사항 표시 |
 
 **예시**
 
 ```bash
-# 현재 디렉토리에서 변경될 내용 미리보기
-uninorm files --dry-run
+# 변경 미리보기
+uninorm files ~/Downloads --dry-run
 
 # ~/Downloads 아래 모든 NFD 파일명 변환
 uninorm files ~/Downloads
@@ -67,7 +74,6 @@ Content:  3
 
 **참고**
 
-- 100 MB를 초과하는 파일은 내용 변환에서 제외됩니다.
 - 내용 변환은 임시 파일에 먼저 쓴 뒤 원본으로 이름 변경하는 방식으로 원자적으로 수행됩니다.
 - `--exclude`는 항목의 이름(전체 경로가 아님)에 대해서만 적용됩니다.
 
@@ -75,97 +81,115 @@ Content:  3
 
 ## `watch`
 
-디렉토리를 감시하다가 파일이 생성되거나 이름이 바뀔 때 NFD 파일명을 자동으로 NFC로 변환합니다. macOS에서는 FSEvents, Linux에서는 inotify, Windows에서는 ReadDirectoryChanges를 사용합니다.
+백그라운드 데몬의 감시 항목을 관리합니다. 파일이 생성/수정될 때 자동으로 변환됩니다.
 
 ```
-uninorm watch [PATH...] [OPTIONS]
+uninorm watch <서브커맨드>
 ```
 
-**인수**
+### `watch add`
 
-| 인수 | 기본값 | 설명 |
-|---|---|---|
-| `PATH` | `.` (현재 디렉토리) | 감시할 디렉토리 (공백으로 여러 개 지정 가능) |
+감시 항목을 추가하거나 업데이트합니다. 데몬이 실행 중이 아니면 자동으로 시작합니다.
 
-**옵션**
+```bash
+uninorm watch add <경로> [옵션]
+```
 
 | 플래그 | 기본값 | 설명 |
 |---|---|---|
-| `--exclude <PATTERN>` | — | 이름이 일치하는 항목 제외 (반복 가능) |
+| `--no-recursive` | false | 서브디렉토리 재귀 처리 안함 |
+| `--content` | false | 파일 내용도 변환 |
+| `--follow-symlinks` | false | 심볼릭 링크 추적 |
+| `--exclude <PATTERN>` | — | 이름 또는 glob 패턴 일치 항목 제외 (반복 가능) |
+| `--max-size <SIZE>` | 100MB | 내용 변환 최대 파일 크기 |
+| `--debounce <MS>` | 300 | 이벤트 디바운스 간격 (밀리초) |
 
-**예시**
+### `watch list`
+
+전체 감시 항목을 번호와 함께 표시합니다.
 
 ```bash
-# 현재 디렉토리 감시
-uninorm watch
-
-# 여러 경로 감시
-uninorm watch ~/Downloads ~/Desktop
-
-# .git 제외하고 감시
-uninorm watch ~/project --exclude .git
-
-# 백그라운드 실행 (셸 작업 제어)
-uninorm watch ~/Downloads &
+uninorm watch list
+#  1. /Users/you/Downloads   [enabled]
+#  2. /Users/you/Documents   [disabled]  (content, excludes: .git, *.log)
 ```
 
-**출력**
+### `watch enable` / `watch disable`
 
+번호로 활성화/비활성화합니다 (쉼표 구분 가능).
+
+```bash
+uninorm watch enable 1,2
+uninorm watch disable 2
 ```
-Watching: /Users/you/Downloads
-Press Ctrl+C to stop.
 
-Renamed: 한글파일.txt → 한글파일.txt
+### `watch remove`
+
+번호로 항목을 삭제합니다 (쉼표 구분 가능).
+
+```bash
+uninorm watch remove 1
 ```
 
-변환 내역은 stdout에 출력되며 `~/.config/uninorm/uninorm.log` 파일에도 기록됩니다.
+### `watch reset`
 
-**Ctrl+C**를 누르면 정상적으로 종료됩니다.
+전체 감시 항목을 삭제하고 데몬을 중지합니다. autostart는 유지됩니다.
 
-**참고**
-
-- 현대 macOS의 APFS는 새로 생성된 파일명을 자동으로 NFC로 정규화합니다. 따라서 `watch`는 주로 외부 소스(USB 드라이브, 네트워크 공유, 구형 HFS+ 볼륨)에서 복사된 파일에 반응합니다.
-- `watch`는 시작 시 전체 스캔을 하지 않습니다. 기존 NFD 파일 변환은 먼저 `uninorm files`를 사용하세요.
+```bash
+uninorm watch reset
+uninorm watch reset -y   # 확인 프롬프트 건너뛰기
+```
 
 ---
 
-## `log`
+## `daemon`
 
-`watch`가 기록한 변환 로그의 최근 항목을 표시합니다.
+백그라운드 데몬 프로세스를 관리합니다. `systemctl start/stop`과 유사합니다.
+
+```bash
+uninorm daemon start       # 데몬 시작
+uninorm daemon stop        # 데몬 중지
+uninorm daemon restart     # 데몬 재시작
+```
+
+데몬은 `uninorm watch add`로 설정한 경로를 감시하고, 파일 시스템 이벤트 발생 시 NFD 파일명(및 선택적으로 내용)을 자동으로 변환합니다.
+
+---
+
+## `autostart`
+
+로그인 시 데몬이 자동으로 시작되도록 등록/해제합니다. `systemctl enable/disable`과 유사합니다.
+
+- **macOS:** LaunchAgent plist 설치
+- **Linux:** systemd user 서비스 설치
+
+```bash
+uninorm autostart on       # 자동 시작 활성화
+uninorm autostart off      # 자동 시작 비활성화
+```
+
+`uninorm` 명령어를 처음 실행하면 자동으로 autostart가 등록됩니다. `watch reset`은 autostart를 제거하지 않습니다 — 명시적으로 비활성화하려면 `uninorm autostart off`를 사용하세요.
+
+---
+
+## `convert`
+
+텍스트를 NFD에서 NFC로 변환하여 출력합니다. 텍스트를 생략하면 stdin에서 읽습니다.
 
 ```
-uninorm log [-n N]
+uninorm convert [텍스트] [옵션]
 ```
 
-**옵션**
-
-| 플래그 | 기본값 | 설명 |
-|---|---|---|
-| `-n / --lines N` | 50 | 표시할 최근 줄 수 |
-
-**로그 위치:** `~/.config/uninorm/uninorm.log`
+| 플래그 | 설명 |
+|---|---|
+| `-c / --clipboard` | 변환 결과를 클립보드에 복사 |
 
 **예시**
 
 ```bash
-# 마지막 50개 항목 (기본값)
-uninorm log
-
-# 마지막 100개 항목
-uninorm log -n 100
-
-# 전체 항목 (페이저 사용)
-uninorm log -n 99999 | less
-```
-
-**출력 예시**
-
-```
-[2024-03-09 14:22:01] Watching: /Users/you/Downloads
-[2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
-[2024-03-09 14:30:02] Watch stopped.
-
-(3 total entries, showing last 3)
+uninorm convert "NFD 텍스트"
+echo "NFD 텍스트" | uninorm convert
+uninorm convert -c "텍스트"   # 변환 후 클립보드에 복사
 ```
 
 ---
@@ -186,8 +210,6 @@ uninorm clipboard
 # → "Clipboard is already NFC — no changes made."
 ```
 
-붙여넣기 후 처리 또는 단축키에 연결해두면 편리합니다.
-
 ---
 
 ## `check`
@@ -195,7 +217,7 @@ uninorm clipboard
 문자열이 이미 NFC로 정규화되어 있는지 확인합니다. NFC가 아니면 종료 코드 `1`을 반환합니다.
 
 ```
-uninorm check TEXT
+uninorm check <텍스트>
 ```
 
 **예시**
@@ -215,15 +237,42 @@ fi
 
 ---
 
-## 로그 파일
+## `log`
 
-`watch`는 아래 경로에 타임스탬프와 함께 항목을 기록합니다:
+최근 변환 로그 항목을 표시합니다.
 
 ```
-~/.config/uninorm/uninorm.log
+uninorm log [-n N]
 ```
 
-디렉토리는 첫 실행 시 자동으로 생성됩니다.
+| 플래그 | 기본값 | 설명 |
+|---|---|---|
+| `-n / --lines N` | 50 | 표시할 최근 줄 수 |
+
+**로그 위치:** `~/.config/uninorm/uninorm.log`
+
+---
+
+## `status`
+
+데몬 상태, autostart 상태, 감시 항목 요약, 최근 로그를 표시합니다.
+
+```
+uninorm status
+```
+
+**출력 예시**
+
+```
+Daemon running (PID 12345)
+Autostart: on
+Watch entries: 2/3 enabled
+Use `uninorm watch list` for details.
+
+Recent activity:
+  [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
+  [2024-03-09 14:30:02] Renamed: café.txt → café.txt
+```
 
 ---
 
