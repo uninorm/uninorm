@@ -83,10 +83,10 @@ enum Commands {
         text: String,
     },
 
-    /// Convert TEXT from NFD to NFC and print the result
+    /// Convert TEXT from NFD to NFC and print the result (reads stdin if no text given)
     Convert {
-        /// Text to convert
-        text: String,
+        /// Text to convert (omit to read from stdin)
+        text: Option<String>,
 
         /// Copy result to clipboard
         #[arg(short = 'c', long)]
@@ -156,6 +156,12 @@ enum WatchAction {
 
     /// Stop the background daemon
     Stop,
+
+    /// Install autostart (LaunchAgent on macOS, systemd on Linux)
+    Install,
+
+    /// Uninstall autostart
+    Uninstall,
 
     /// Remove all watch entries and stop daemon
     Reset {
@@ -443,7 +449,22 @@ async fn main() -> Result<()> {
 
                 if DaemonController::status().is_some() {
                     let _ = DaemonController::reload();
-                    println!("Daemon notified to reload config.");
+                    println!("Daemon reloaded.");
+                } else {
+                    match DaemonController::start() {
+                        Ok(pid) => println!("Daemon started (PID {pid})."),
+                        Err(DaemonError::UnsupportedPlatform) => {}
+                        Err(e) => eprintln!("Warning: could not start daemon: {e}"),
+                    }
+                }
+
+                // Auto-install autostart on first watch add
+                if !uninorm_daemon::autostart::is_installed() {
+                    match uninorm_daemon::autostart::install() {
+                        Ok(()) => println!("Autostart installed (daemon will start on login)."),
+                        Err(DaemonError::UnsupportedPlatform) => {}
+                        Err(e) => eprintln!("Warning: could not install autostart: {e}"),
+                    }
                 }
             }
 
@@ -567,6 +588,33 @@ async fn main() -> Result<()> {
                 }
             }
 
+            WatchAction::Install => {
+                match uninorm_daemon::autostart::install() {
+                    Ok(()) => {
+                        println!("Autostart installed.");
+                        if let Some(path) = uninorm_daemon::autostart::autostart_path() {
+                            println!("  {}", path.display());
+                        }
+                        println!("The daemon will start automatically on login.");
+                    }
+                    Err(DaemonError::UnsupportedPlatform) => {
+                        eprintln!("Autostart is only available on macOS and Linux.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
+            WatchAction::Uninstall => {
+                match uninorm_daemon::autostart::uninstall() {
+                    Ok(()) => println!("Autostart removed."),
+                    Err(DaemonError::UnsupportedPlatform) => {
+                        eprintln!("Autostart is only available on macOS and Linux.");
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+
             WatchAction::Reset { yes } => {
                 let cfg = config::WatchConfig::load()?;
                 if cfg.entries.is_empty() {
@@ -622,6 +670,12 @@ async fn main() -> Result<()> {
                         println!("Daemon not running.");
                     }
                 }
+            }
+
+            if uninorm_daemon::autostart::is_installed() {
+                println!("Autostart: installed");
+            } else {
+                println!("Autostart: not installed (run `uninorm watch install` to enable)");
             }
 
             let cfg = config::WatchConfig::load()?;
@@ -683,13 +737,25 @@ async fn main() -> Result<()> {
 
         // -- convert --
         Commands::Convert { text, clipboard } => {
-            let nfc = uninorm_core::convert_text(&text);
+            let input = match text {
+                Some(t) => t,
+                None => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
+                    buf
+                }
+            };
 
-            if nfc == text {
-                println!("{nfc}");
+            let nfc = uninorm_core::convert_text(&input);
+
+            if nfc == input {
+                print!("{nfc}");
                 eprintln!("(already NFC)");
             } else {
-                println!("{nfc}");
+                print!("{nfc}");
             }
 
             if clipboard {

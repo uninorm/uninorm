@@ -100,12 +100,15 @@ impl DaemonController {
         }
     }
 
-    /// Stop daemon if running and remove all config.
+    /// Stop daemon if running, uninstall autostart, and remove all config.
     pub fn reset() -> Result<()> {
         // Stop daemon first if running
         if config::is_daemon_running() {
             let _ = Self::stop();
         }
+
+        // Remove autostart registration
+        let _ = crate::autostart::uninstall();
 
         let path = config::config_path()?;
         if path.exists() {
