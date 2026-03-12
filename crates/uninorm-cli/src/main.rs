@@ -577,11 +577,10 @@ async fn main() -> Result<()> {
                 }
 
                 if !yes {
-                    print!("Remove all {} watch entries? [y/N] ", cfg.entries.len());
-                    std::io::stdout().flush()?;
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input)?;
-                    if !input.trim().eq_ignore_ascii_case("y") {
+                    if !confirm(&format!(
+                        "Remove all {} watch entries?",
+                        cfg.entries.len()
+                    )) {
                         println!("Cancelled.");
                         return Ok(());
                     }
@@ -609,21 +608,35 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            use std::io::BufRead;
-            let file = std::fs::File::open(&path)?;
-            let reader = std::io::BufReader::new(file);
-            let all: Vec<String> = reader.lines().collect::<Result<_, _>>()?;
-            let start = all.len().saturating_sub(lines);
-            for line in &all[start..] {
+            // Read from the end of the file to avoid loading the entire log into memory.
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            let file_len = file.metadata()?.len();
+
+            // Read a reasonable tail chunk (64KB should hold many lines)
+            let chunk_size = 64 * 1024u64;
+            let start_pos = file_len.saturating_sub(chunk_size);
+            file.seek(SeekFrom::Start(start_pos))?;
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+
+            let all_lines: Vec<&str> = buf.lines().collect();
+            // If we seeked into the middle, the first line may be partial — skip it
+            let tail = if start_pos > 0 && all_lines.len() > 1 {
+                &all_lines[1..]
+            } else {
+                &all_lines[..]
+            };
+            let start = tail.len().saturating_sub(lines);
+            for line in &tail[start..] {
                 println!("{line}");
             }
-            if all.is_empty() {
+            if tail.is_empty() {
                 println!("Log is empty.");
             } else {
                 println!(
-                    "\n({} total entries, showing last {})",
-                    all.len(),
-                    lines.min(all.len())
+                    "\n(showing last {})",
+                    lines.min(tail.len())
                 );
             }
         }
@@ -652,16 +665,26 @@ async fn main() -> Result<()> {
                 println!("No watch entries configured.");
             }
 
-            // Show last 5 log lines
+            // Show last 5 log lines (read only the tail to avoid loading entire file)
             if let Ok(log) = config::log_path() {
                 if log.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&log) {
-                        let all: Vec<&str> = content.lines().collect();
-                        let recent = &all[all.len().saturating_sub(5)..];
-                        if !recent.is_empty() {
-                            println!("\nRecent activity:");
-                            for l in recent {
-                                println!("  {l}");
+                    if let Ok(mut file) = std::fs::File::open(&log) {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                        let chunk_size = 4 * 1024u64; // 4KB is plenty for 5 lines
+                        let start_pos = file_len.saturating_sub(chunk_size);
+                        let _ = file.seek(SeekFrom::Start(start_pos));
+                        let mut buf = String::new();
+                        if file.read_to_string(&mut buf).is_ok() {
+                            let all: Vec<&str> = buf.lines().collect();
+                            let skip_first = if start_pos > 0 && !all.is_empty() { 1 } else { 0 };
+                            let tail = &all[skip_first..];
+                            let recent = &tail[tail.len().saturating_sub(5)..];
+                            if !recent.is_empty() {
+                                println!("\nRecent activity:");
+                                for l in recent {
+                                    println!("  {l}");
+                                }
                             }
                         }
                     }

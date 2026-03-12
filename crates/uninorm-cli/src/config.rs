@@ -26,7 +26,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WatchConfig {
     pub entries: Vec<WatchEntry>,
     /// Event debounce interval in milliseconds. None = 300ms default.
@@ -156,8 +156,8 @@ fn is_our_daemon(pid: u32) -> bool {
                 return name.contains("uninorm");
             }
         }
-        // If proc_pidpath fails, fall back to PID-only check
-        true
+        // If proc_pidpath fails, do not trust the PID (could be a recycled process)
+        false
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -167,8 +167,8 @@ fn is_our_daemon(pid: u32) -> bool {
                 return name.contains("uninorm");
             }
         }
-        // Fallback: trust kill(0) result
-        true
+        // If /proc check fails, do not trust the PID (could be a recycled process)
+        false
     }
 }
 

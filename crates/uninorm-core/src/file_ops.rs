@@ -18,7 +18,11 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn temp_name() -> String {
     let pid = std::process::id();
     let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(".uninorm_tmp_{pid}_{count}")
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(".uninorm_tmp_{pid}_{ts}_{count}")
 }
 
 /// Compile exclude patterns into a `GlobSet` for efficient matching.

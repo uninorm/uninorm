@@ -109,15 +109,23 @@ struct CompiledEntry<'a> {
     globs: globset::GlobSet,
 }
 
-/// Rename a single file if it needs NFD→NFC conversion.
-/// Returns `(log_message, nfc_path_if_renamed)`.
-fn rename_if_needed(path: &Path, ce: &CompiledEntry<'_>) -> (Option<String>, Option<PathBuf>) {
+/// Lightweight view for use inside `spawn_blocking` closures.
+struct InlineCompiledEntry<'a> {
+    entry_path: &'a Path,
+    globs: &'a globset::GlobSet,
+}
+
+/// Rename variant that works with `InlineCompiledEntry` (for spawn_blocking).
+fn rename_if_needed_inline(
+    path: &Path,
+    ce: &InlineCompiledEntry<'_>,
+) -> (Option<String>, Option<PathBuf>) {
     let Some(file_name_os) = path.file_name() else {
         return (None, None);
     };
     let file_name = file_name_os.to_string_lossy();
 
-    if uninorm_core::is_excluded(path, &ce.entry.path, &ce.globs) {
+    if uninorm_core::is_excluded(path, ce.entry_path, ce.globs) {
         return (None, None);
     }
 
@@ -255,7 +263,11 @@ async fn run_daemon_platform() -> Result<()> {
 
         let debounce_ms = watch_config.debounce_ms.unwrap_or(300);
 
-        cleanup_stale_temps(&watch_config);
+        {
+            let cfg_ref = watch_config.clone();
+            tokio::task::spawn_blocking(move || cleanup_stale_temps(&cfg_ref))
+                .await?;
+        }
 
         // Pre-compile glob sets for enabled entries only
         let compiled: Vec<CompiledEntry<'_>> = watch_config
@@ -306,6 +318,7 @@ async fn run_daemon_platform() -> Result<()> {
         }
 
         // Inner loop: process events with debounce
+        const MAX_PENDING: usize = 10_000;
         let mut pending_paths: HashMap<PathBuf, bool> = HashMap::new(); // path -> is_name_event
         let debounce_dur = std::time::Duration::from_millis(debounce_ms);
         let mut debounce_timer = tokio::time::interval(debounce_dur);
@@ -341,6 +354,10 @@ async fn run_daemon_platform() -> Result<()> {
                                     continue;
                                 }
                                 // Merge: if we already have a name event, keep it
+                                if pending_paths.len() >= MAX_PENDING && !pending_paths.contains_key(&path) {
+                                    append_log("Warning: pending event queue full, dropping event");
+                                    continue;
+                                }
                                 let existing_is_name = pending_paths.get(&path).copied().unwrap_or(false);
                                 pending_paths.insert(path, existing_is_name || is_name_event);
                             }
@@ -354,41 +371,63 @@ async fn run_daemon_platform() -> Result<()> {
                     }
 
                     let batch = std::mem::take(&mut pending_paths);
+
+                    // Run blocking file I/O on the blocking thread pool
+                    // to avoid starving the async event loop.
+                    let compiled_ref = &compiled;
                     for (path, is_name_event) in &batch {
-                        let Some(ce) = find_entry_for_path(path, &compiled) else {
+                        let Some(ce) = find_entry_for_path(path, compiled_ref) else {
                             continue;
                         };
 
-                        // Skip symlinks unless follow_symlinks is enabled
-                        if !ce.entry.follow_symlinks {
-                            if let Ok(m) = std::fs::symlink_metadata(path) {
-                                if m.file_type().is_symlink() {
-                                    continue;
+                        let path = path.clone();
+                        let is_name = *is_name_event;
+                        let entry_path = ce.entry.path.clone();
+                        let globs = ce.globs.clone();
+                        let content_enabled = ce.entry.content;
+                        let follow_symlinks = ce.entry.follow_symlinks;
+                        let max_bytes = ce.entry.max_content_bytes
+                            .unwrap_or(uninorm_core::DEFAULT_MAX_CONTENT_BYTES);
+
+                        let messages = tokio::task::spawn_blocking(move || {
+                            let mut msgs = Vec::new();
+
+                            // Skip symlinks unless follow_symlinks is enabled
+                            if !follow_symlinks {
+                                if let Ok(m) = std::fs::symlink_metadata(&path) {
+                                    if m.file_type().is_symlink() {
+                                        return msgs;
+                                    }
                                 }
                             }
-                        }
 
-                        // Rename on create/name events
-                        let nfc_path = if *is_name_event {
-                            let (msg, renamed_path) = rename_if_needed(path, ce);
-                            if let Some(msg) = msg {
-                                append_log(&msg);
-                            }
-                            renamed_path
-                        } else {
-                            None
-                        };
+                            // Rename on create/name events
+                            let nfc_path = if is_name {
+                                let ce_inline = InlineCompiledEntry { entry_path: &entry_path, globs: &globs };
+                                let (msg, renamed_path) = rename_if_needed_inline(&path, &ce_inline);
+                                if let Some(msg) = msg {
+                                    msgs.push(msg);
+                                }
+                                renamed_path
+                            } else {
+                                None
+                            };
 
-                        // Convert content if enabled and not excluded
-                        if ce.entry.content {
-                            let target = nfc_path.as_deref().unwrap_or(path);
-                            if !uninorm_core::is_excluded(target, &ce.entry.path, &ce.globs) {
-                                let max_bytes = ce.entry.max_content_bytes
-                                    .unwrap_or(uninorm_core::DEFAULT_MAX_CONTENT_BYTES);
-                                if let Some(msg) = convert_content_if_needed(target, max_bytes) {
-                                    append_log(&msg);
+                            // Convert content if enabled and not excluded
+                            if content_enabled {
+                                let target = nfc_path.as_deref().unwrap_or(&path);
+                                if !uninorm_core::is_excluded(target, &entry_path, &globs) {
+                                    if let Some(msg) = convert_content_if_needed(target, max_bytes) {
+                                        msgs.push(msg);
+                                    }
                                 }
                             }
+
+                            msgs
+                        }).await.unwrap_or_default();
+
+                        for msg in messages {
+                            append_log(&msg);
                         }
                     }
                 }
