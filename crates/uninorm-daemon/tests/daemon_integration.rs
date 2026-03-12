@@ -128,7 +128,10 @@ async fn test_exclude_pattern_skips_matching_files() {
     let stats = uninorm_core::convert_path(tmp.path(), &opts, |_| {}).await;
     assert!(stats.is_ok());
     let stats = stats.unwrap();
-    assert_eq!(stats.files_renamed, 0, "excluded file should not be renamed");
+    assert_eq!(
+        stats.files_renamed, 0,
+        "excluded file should not be renamed"
+    );
     assert!(nfd_path.exists(), "original NFD file should still exist");
 }
 
@@ -247,7 +250,10 @@ async fn test_scan_detects_nfd_files_and_content() {
     let scan = uninorm_core::scan_path(tmp.path(), &opts).await;
     assert!(scan.rename_count() >= 1, "should detect NFD filename");
     assert!(scan.content_count() >= 1, "should detect NFD content");
-    assert!(scan.affected_count() >= 2, "should have at least 2 affected entries");
+    assert!(
+        scan.affected_count() >= 2,
+        "should have at least 2 affected entries"
+    );
 }
 
 #[tokio::test]
@@ -271,7 +277,11 @@ async fn test_scan_respects_non_recursive() {
     };
 
     let scan = uninorm_core::scan_path(tmp.path(), &opts).await;
-    assert_eq!(scan.rename_count(), 0, "non-recursive should not find files in subdir");
+    assert_eq!(
+        scan.rename_count(),
+        0,
+        "non-recursive should not find files in subdir"
+    );
 }
 
 // ---------------------------------------------------------------------------

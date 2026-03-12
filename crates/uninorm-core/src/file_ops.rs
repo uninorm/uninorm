@@ -41,9 +41,11 @@ pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
             }
         }
     }
-    let set = builder
-        .build()
-        .unwrap_or_else(|_| GlobSetBuilder::new().build().expect("empty GlobSet must build"));
+    let set = builder.build().unwrap_or_else(|_| {
+        GlobSetBuilder::new()
+            .build()
+            .expect("empty GlobSet must build")
+    });
     (set, invalid)
 }
 
@@ -211,10 +213,9 @@ pub async fn convert_path(
                 ));
             } else if !opts.dry_run {
                 let Some(parent) = ce.path.parent() else {
-                    stats.errors.push(format!(
-                        "Cannot rename root path: {}",
-                        ce.path.display()
-                    ));
+                    stats
+                        .errors
+                        .push(format!("Cannot rename root path: {}", ce.path.display()));
                     continue;
                 };
                 let tmp = parent.join(temp_name());
@@ -387,7 +388,9 @@ pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
     let mut result = ScanResult::default();
     let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
     for pat in &invalid_patterns {
-        result.errors.push(format!("Invalid exclude pattern ignored: {pat}"));
+        result
+            .errors
+            .push(format!("Invalid exclude pattern ignored: {pat}"));
     }
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
     let walker = WalkDir::new(path)

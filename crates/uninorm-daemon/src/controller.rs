@@ -107,9 +107,6 @@ impl DaemonController {
             let _ = Self::stop();
         }
 
-        // Remove autostart registration
-        let _ = crate::autostart::uninstall();
-
         let path = config::config_path()?;
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| {

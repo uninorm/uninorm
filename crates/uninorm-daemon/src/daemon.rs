@@ -20,7 +20,7 @@ pub fn spawn_daemon() -> std::io::Result<()> {
         use std::os::unix::process::CommandExt;
         unsafe {
             std::process::Command::new(exe)
-                .arg("daemon")
+                .arg("daemon-run")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -37,7 +37,7 @@ pub fn spawn_daemon() -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         std::process::Command::new(exe)
-            .arg("daemon")
+            .arg("daemon-run")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

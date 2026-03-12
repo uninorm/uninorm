@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::error::DaemonError;
 
+#[cfg(target_os = "macos")]
 const MACOS_LABEL: &str = "com.uninorm.daemon";
 #[cfg(target_os = "linux")]
 const LINUX_UNIT: &str = "uninorm.service";
@@ -107,7 +108,7 @@ fn install_launchagent(exe: &std::path::Path) -> Result<(), DaemonError> {
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
-        <string>daemon</string>
+        <string>daemon-run</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -125,12 +126,14 @@ fn install_launchagent(exe: &std::path::Path) -> Result<(), DaemonError> {
     );
 
     std::fs::write(&plist_path, plist).map_err(|e| {
-        DaemonError::Io(std::io::Error::other(format!(
-            "failed to write plist: {e}"
-        )))
+        DaemonError::Io(std::io::Error::other(format!("failed to write plist: {e}")))
     })?;
 
-    // plist is picked up by launchd on next login (RunAtLoad=true)
+    // Load immediately so the daemon starts right away (not just on next login)
+    let _ = std::process::Command::new("launchctl")
+        .args(["load", &plist_path.display().to_string()])
+        .output();
+
     Ok(())
 }
 
@@ -180,7 +183,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart={exe} daemon
+ExecStart={exe} daemon-run
 Restart=on-failure
 RestartSec=5
 
@@ -202,7 +205,7 @@ WantedBy=default.target
         .output();
 
     let output = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", LINUX_UNIT])
+        .args(["--user", "enable", LINUX_UNIT])
         .output()
         .map_err(|e| {
             DaemonError::Io(std::io::Error::other(format!(

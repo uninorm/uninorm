@@ -74,6 +74,18 @@ enum Commands {
     /// Show watcher status (daemon PID, watched paths, recent activity)
     Status,
 
+    /// Manage autostart (on/off) — register daemon to start on login
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
+
+    /// Manage the background daemon (start/stop/restart)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
     /// Convert clipboard text from NFD to NFC and write it back
     Clipboard,
 
@@ -93,9 +105,9 @@ enum Commands {
         clipboard: bool,
     },
 
-    /// Internal: run as background daemon
-    #[command(hide = true)]
-    Daemon,
+    /// Internal: run as background daemon process
+    #[command(hide = true, name = "daemon-run")]
+    DaemonRun,
 }
 
 #[derive(Subcommand)]
@@ -151,24 +163,30 @@ enum WatchAction {
         indices: String,
     },
 
-    /// Start the background daemon
-    Start,
-
-    /// Stop the background daemon
-    Stop,
-
-    /// Install autostart (LaunchAgent on macOS, systemd on Linux)
-    Install,
-
-    /// Uninstall autostart
-    Uninstall,
-
     /// Remove all watch entries and stop daemon
     Reset {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum AutostartAction {
+    /// Enable autostart (daemon starts on login)
+    On,
+    /// Disable autostart
+    Off,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon
+    Start,
+    /// Stop the daemon
+    Stop,
+    /// Restart the daemon (stop + start)
+    Restart,
 }
 
 // -- Helpers --
@@ -304,6 +322,16 @@ fn read_tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<Stri
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Auto-register autostart on first run of any command
+    if !uninorm_daemon::autostart::is_installed() {
+        if let Err(e) = uninorm_daemon::autostart::install() {
+            match e {
+                DaemonError::UnsupportedPlatform => {}
+                e => eprintln!("Warning: could not install autostart: {e}"),
+            }
+        }
+    }
 
     match cli.command {
         // -- files: batch convert --
@@ -457,15 +485,6 @@ async fn main() -> Result<()> {
                         Err(e) => eprintln!("Warning: could not start daemon: {e}"),
                     }
                 }
-
-                // Auto-install autostart on first watch add
-                if !uninorm_daemon::autostart::is_installed() {
-                    match uninorm_daemon::autostart::install() {
-                        Ok(()) => println!("Autostart installed (daemon will start on login)."),
-                        Err(DaemonError::UnsupportedPlatform) => {}
-                        Err(e) => eprintln!("Warning: could not install autostart: {e}"),
-                    }
-                }
             }
 
             WatchAction::Remove { indices } => {
@@ -547,74 +566,6 @@ async fn main() -> Result<()> {
                 let _ = DaemonController::reload();
             }
 
-            WatchAction::Start => {
-                match DaemonController::start() {
-                    Ok(pid) => {
-                        println!("Daemon started (PID {pid}).");
-                        let cfg = config::WatchConfig::load()?;
-                        let enabled_count = cfg.enabled_count();
-                        println!("\nWatching ({enabled_count} entries):");
-                        for entry in cfg.entries.iter().filter(|e| e.enabled) {
-                            println!("  {}", entry.path.display());
-                        }
-                    }
-                    Err(DaemonError::AlreadyRunning { pid }) => {
-                        println!("Daemon already running (PID {pid}).");
-                    }
-                    Err(DaemonError::NoEnabledEntries) => {
-                        println!("No enabled watch entries.");
-                        println!("Add one with: uninorm watch add <path>");
-                    }
-                    Err(DaemonError::UnsupportedPlatform) => {
-                        eprintln!("Background watch daemon is only available on macOS.");
-                        eprintln!();
-                        eprintln!("On Windows/Linux, use `uninorm files <path>` to batch-convert");
-                        eprintln!("NFD filenames (e.g. files synced from iCloud or macOS).");
-                        std::process::exit(1);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            WatchAction::Stop => {
-                match DaemonController::stop() {
-                    Ok(()) => println!("Daemon stopped."),
-                    Err(DaemonError::NotRunning) => println!("Daemon is not running."),
-                    Err(DaemonError::UnsupportedPlatform) => {
-                        eprintln!("Background watch daemon is only available on macOS.");
-                        eprintln!("Use `uninorm files <path>` to batch-convert NFD filenames.");
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            WatchAction::Install => {
-                match uninorm_daemon::autostart::install() {
-                    Ok(()) => {
-                        println!("Autostart installed.");
-                        if let Some(path) = uninorm_daemon::autostart::autostart_path() {
-                            println!("  {}", path.display());
-                        }
-                        println!("The daemon will start automatically on login.");
-                    }
-                    Err(DaemonError::UnsupportedPlatform) => {
-                        eprintln!("Autostart is only available on macOS and Linux.");
-                        std::process::exit(1);
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            WatchAction::Uninstall => {
-                match uninorm_daemon::autostart::uninstall() {
-                    Ok(()) => println!("Autostart removed."),
-                    Err(DaemonError::UnsupportedPlatform) => {
-                        eprintln!("Autostart is only available on macOS and Linux.");
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
             WatchAction::Reset { yes } => {
                 let cfg = config::WatchConfig::load()?;
                 if cfg.entries.is_empty() {
@@ -622,12 +573,7 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                if !yes
-                    && !confirm(&format!(
-                        "Remove all {} watch entries?",
-                        cfg.entries.len()
-                    ))
-                {
+                if !yes && !confirm(&format!("Remove all {} watch entries?", cfg.entries.len())) {
                     println!("Cancelled.");
                     return Ok(());
                 }
@@ -673,9 +619,9 @@ async fn main() -> Result<()> {
             }
 
             if uninorm_daemon::autostart::is_installed() {
-                println!("Autostart: installed");
+                println!("Autostart: on");
             } else {
-                println!("Autostart: not installed (run `uninorm watch install` to enable)");
+                println!("Autostart: off (run `uninorm autostart on` to enable)");
             }
 
             let cfg = config::WatchConfig::load()?;
@@ -767,8 +713,81 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -- daemon (hidden, internal) --
-        Commands::Daemon => {
+        // -- daemon start/stop/restart --
+        Commands::Daemon { action } => match action {
+            DaemonAction::Start => match DaemonController::start() {
+                Ok(pid) => {
+                    println!("Daemon started (PID {pid}).");
+                    let cfg = config::WatchConfig::load()?;
+                    let enabled_count = cfg.enabled_count();
+                    println!("Watching {enabled_count} entries.");
+                }
+                Err(DaemonError::AlreadyRunning { pid }) => {
+                    println!("Daemon already running (PID {pid}).");
+                }
+                Err(DaemonError::NoEnabledEntries) => {
+                    println!("No enabled watch entries.");
+                    println!("Add one with: uninorm watch add <path>");
+                }
+                Err(DaemonError::UnsupportedPlatform) => {
+                    eprintln!("Daemon is not available on this platform.");
+                    std::process::exit(1);
+                }
+                Err(e) => return Err(e.into()),
+            },
+            DaemonAction::Stop => match DaemonController::stop() {
+                Ok(()) => println!("Daemon stopped."),
+                Err(DaemonError::NotRunning) => println!("Daemon is not running."),
+                Err(DaemonError::UnsupportedPlatform) => {
+                    eprintln!("Daemon is not available on this platform.");
+                }
+                Err(e) => return Err(e.into()),
+            },
+            DaemonAction::Restart => {
+                if DaemonController::status().is_some() {
+                    let _ = DaemonController::stop();
+                }
+                match DaemonController::start() {
+                    Ok(pid) => println!("Daemon restarted (PID {pid})."),
+                    Err(DaemonError::NoEnabledEntries) => {
+                        println!("No enabled watch entries.");
+                        println!("Add one with: uninorm watch add <path>");
+                    }
+                    Err(DaemonError::UnsupportedPlatform) => {
+                        eprintln!("Daemon is not available on this platform.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        },
+
+        // -- autostart on/off --
+        Commands::Autostart { action } => match action {
+            AutostartAction::On => match uninorm_daemon::autostart::install() {
+                Ok(()) => {
+                    println!("Autostart enabled.");
+                    if let Some(path) = uninorm_daemon::autostart::autostart_path() {
+                        println!("  {}", path.display());
+                    }
+                }
+                Err(DaemonError::UnsupportedPlatform) => {
+                    eprintln!("Autostart is only available on macOS and Linux.");
+                    std::process::exit(1);
+                }
+                Err(e) => return Err(e.into()),
+            },
+            AutostartAction::Off => match uninorm_daemon::autostart::uninstall() {
+                Ok(()) => println!("Autostart disabled."),
+                Err(DaemonError::UnsupportedPlatform) => {
+                    eprintln!("Autostart is only available on macOS and Linux.");
+                }
+                Err(e) => return Err(e.into()),
+            },
+        },
+
+        // -- daemon-run (hidden, internal) --
+        Commands::DaemonRun => {
             uninorm_daemon::daemon::run_daemon().await?;
         }
     }
