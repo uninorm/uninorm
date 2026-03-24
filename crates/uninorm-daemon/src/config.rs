@@ -128,8 +128,19 @@ pub fn load_global_ignore() -> Vec<String> {
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            eprintln!("Warning: could not read global ignore file: {e}");
+            return Vec::new();
+        }
     };
+    parse_ignore_patterns(&content)
+}
+
+/// Parse ignore file content into a list of glob patterns.
+/// Handles UTF-8 BOM, comments (`#`), and blank lines.
+pub fn parse_ignore_patterns(content: &str) -> Vec<String> {
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(content);
     content
         .lines()
         .map(str::trim)
@@ -545,40 +556,30 @@ mod tests {
     }
 
     #[test]
-    fn test_load_global_ignore_parses_patterns() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ignore_file = tmp.path().join("ignore");
-        fs::write(
-            &ignore_file,
-            "# comment\n\n.git\nnode_modules\n  *.pyc  \n# another comment\n",
-        )
-        .unwrap();
-
-        let content = fs::read_to_string(&ignore_file).unwrap();
-        let patterns: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(String::from)
-            .collect();
-
+    fn test_parse_ignore_patterns_basic() {
+        let content = "# comment\n\n.git\nnode_modules\n  *.pyc  \n# another comment\n";
+        let patterns = super::parse_ignore_patterns(content);
         assert_eq!(patterns, vec![".git", "node_modules", "*.pyc"]);
     }
 
     #[test]
-    fn test_load_global_ignore_empty_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let ignore_file = tmp.path().join("ignore");
-        fs::write(&ignore_file, "# only comments\n\n").unwrap();
-
-        let content = fs::read_to_string(&ignore_file).unwrap();
-        let patterns: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(String::from)
-            .collect();
-
+    fn test_parse_ignore_patterns_empty() {
+        let content = "# only comments\n\n";
+        let patterns = super::parse_ignore_patterns(content);
         assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ignore_patterns_strips_bom() {
+        let content = "\u{FEFF}# BOM file\n.git\ntarget\n";
+        let patterns = super::parse_ignore_patterns(content);
+        assert_eq!(patterns, vec![".git", "target"]);
+    }
+
+    #[test]
+    fn test_parse_ignore_patterns_windows_line_endings() {
+        let content = ".git\r\nnode_modules\r\n*.log\r\n";
+        let patterns = super::parse_ignore_patterns(content);
+        assert_eq!(patterns, vec![".git", "node_modules", "*.log"]);
     }
 }
