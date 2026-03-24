@@ -182,7 +182,8 @@ fn initial_scan(entries: Vec<InitialScanEntry>, log: impl Fn(&str)) {
             if entry.content {
                 let target = renamed_path.as_deref().unwrap_or(&path);
                 if !uninorm_core::is_excluded(target, &entry.path, &entry.globs) {
-                    if let Some(result) = convert_content_if_needed(target, entry.max_content_bytes) {
+                    if let Some(result) = convert_content_if_needed(target, entry.max_content_bytes)
+                    {
                         if result.is_converted() {
                             content_count += 1;
                         }
@@ -256,10 +257,7 @@ fn rename_if_needed_inline(
     };
     let Some(file_name) = file_name_os.to_str() else {
         return (
-            Some(format!(
-                "Skipped non-UTF-8 filename: {}",
-                path.display()
-            )),
+            Some(format!("Skipped non-UTF-8 filename: {}", path.display())),
             None,
         );
     };
