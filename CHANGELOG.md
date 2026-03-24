@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `uninorm files --max-size <SIZE>` — maximum file size for content conversion (default 100MB)
 - `uninorm files -y/--yes` — skip confirmation prompt
 - `uninorm files -v/--verbose` — show individual file changes
+- `uninorm files --no-global-ignore` — opt out of global ignore patterns
 - `uninorm watch add <PATH>` — add a watch entry (starts daemon automatically)
 - `uninorm watch remove/list/enable/disable/reset` — manage watch entries
 - `uninorm daemon start/stop/restart` — manage the background daemon process
@@ -41,10 +42,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 #### uninorm-daemon
 - Background daemon with filesystem watching (FSEvents on macOS, inotify on Linux)
 - Watch entry config with per-entry options (recursive, content, follow-symlinks, exclude, max-size)
+- **Initial scan on daemon start**: pre-existing NFD files are converted when the daemon starts or reloads config, not just new filesystem events
 - Daemon controller: start/stop/restart/reload
 - Autostart: LaunchAgent (macOS) with immediate `launchctl load`, systemd user service (Linux)
 - Debounce support for filesystem events
 - PID file management with stale PID cleanup
+- **Global ignore file** (`~/.config/uninorm/ignore`): define patterns excluded from all watch entries and `files` commands by default
+- UID/GID preservation during content conversion on Unix
+- Non-UTF-8 filenames safely skipped with log message
 
 ### Fixed
 

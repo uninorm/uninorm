@@ -40,6 +40,9 @@ uninorm files ~/Downloads --content
 # 디렉토리 감시 (데몬 자동 시작)
 uninorm watch add ~/Downloads
 
+# 글로벌 ignore 패턴 설정 (선택)
+echo -e ".git\nnode_modules\n.DS_Store" > ~/.config/uninorm/ignore
+
 # 클립보드 텍스트 변환
 uninorm clipboard
 

@@ -40,6 +40,7 @@ uninorm files <경로> [옵션]
 | `--follow-symlinks` | false | 심볼릭 링크 추적 |
 | `--exclude <PATTERN>` | — | 이름 또는 glob 패턴 일치 항목 제외 (반복 가능) |
 | `--max-size <SIZE>` | 100MB | 내용 변환 최대 파일 크기 (예: `50MB`, `1GB`) |
+| `--no-global-ignore` | false | 글로벌 ignore 패턴 적용 안함 |
 | `-y / --yes` | false | 확인 프롬프트 건너뛰기 |
 | `-v / --verbose` | false | 개별 파일 변경 사항 표시 |
 
@@ -273,6 +274,26 @@ Recent activity:
   [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
   [2024-03-09 14:30:02] Renamed: café.txt → café.txt
 ```
+
+---
+
+## 글로벌 ignore
+
+`~/.config/uninorm/ignore` 파일을 생성하면 항상 제외할 패턴을 정의할 수 있습니다. `watch` 데몬과 `files` 명령 모두에 기본 적용됩니다.
+
+```
+# ~/.config/uninorm/ignore
+.git
+node_modules
+target
+__pycache__
+.DS_Store
+*.pyc
+```
+
+형식: 한 줄에 glob 패턴 하나, `#`은 주석, 빈 줄 무시.
+
+`files` 명령은 `--no-global-ignore`로 비활성화할 수 있습니다. 데몬은 항상 글로벌 ignore를 적용하며, 항목별 제외는 `--exclude`를 사용하세요.
 
 ---
 

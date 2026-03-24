@@ -40,6 +40,7 @@ uninorm files <PATH> [OPTIONS]
 | `--follow-symlinks` | false | Follow symbolic links |
 | `--exclude <PATTERN>` | — | Skip entries matching name or glob pattern (repeatable) |
 | `--max-size <SIZE>` | 100MB | Maximum file size for content conversion (e.g. `50MB`, `1GB`) |
+| `--no-global-ignore` | false | Do not apply global ignore patterns |
 | `-y / --yes` | false | Skip confirmation prompt |
 | `-v / --verbose` | false | Show individual file changes |
 
@@ -273,6 +274,26 @@ Recent activity:
   [2024-03-09 14:23:15] Renamed: 한글파일.txt → 한글파일.txt
   [2024-03-09 14:30:02] Renamed: café.txt → café.txt
 ```
+
+---
+
+## Global ignore
+
+Create `~/.config/uninorm/ignore` to define patterns that are always excluded — applied to both the `watch` daemon and `files` by default.
+
+```
+# ~/.config/uninorm/ignore
+.git
+node_modules
+target
+__pycache__
+.DS_Store
+*.pyc
+```
+
+Format: one glob pattern per line, `#` for comments, blank lines ignored.
+
+The `files` command can opt out with `--no-global-ignore`. The daemon always applies global ignore patterns; use per-entry `--exclude` for entry-specific overrides.
 
 ---
 

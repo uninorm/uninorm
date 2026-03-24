@@ -40,6 +40,9 @@ uninorm files ~/Downloads --content
 # Watch a directory for new files (starts daemon automatically)
 uninorm watch add ~/Downloads
 
+# Set up global ignore patterns (optional)
+echo -e ".git\nnode_modules\n.DS_Store" > ~/.config/uninorm/ignore
+
 # Convert clipboard text
 uninorm clipboard
 
