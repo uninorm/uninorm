@@ -23,6 +23,9 @@ pub struct WatchEntry {
     /// Whether this entry is active. Disabled entries are skipped by the daemon.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Whether to apply global ignore patterns to this entry. Default: true.
+    #[serde(default = "default_true")]
+    pub use_global_ignore: bool,
 }
 
 fn default_true() -> bool {
@@ -119,22 +122,26 @@ pub fn ignore_path() -> Result<PathBuf> {
 }
 
 /// Load global ignore patterns from `~/.config/uninorm/ignore`.
-/// Returns an empty vec if the file does not exist.
+/// Returns `(patterns, warning)`. Warning is `Some` if the file exists but
+/// could not be read (e.g. permission denied). Missing file returns empty patterns
+/// with no warning.
 /// Format: one glob pattern per line, `#` for comments, blank lines ignored.
-pub fn load_global_ignore() -> Vec<String> {
+pub fn load_global_ignore() -> (Vec<String>, Option<String>) {
     let path = match ignore_path() {
         Ok(p) => p,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), None),
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
         Err(e) => {
-            eprintln!("Warning: could not read global ignore file: {e}");
-            return Vec::new();
+            return (
+                Vec::new(),
+                Some(format!("Warning: could not read global ignore file: {e}")),
+            );
         }
     };
-    parse_ignore_patterns(&content)
+    (parse_ignore_patterns(&content), None)
 }
 
 /// Parse ignore file content into a list of glob patterns.
@@ -276,6 +283,7 @@ mod tests {
             exclude: vec![".git".to_string()],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         cfg
     }
@@ -297,6 +305,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         assert!(is_new);
         assert_eq!(cfg.entries.len(), 1);
@@ -313,6 +322,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         let is_new = cfg.add_entry(WatchEntry {
             path: "/tmp/test".into(),
@@ -322,6 +332,7 @@ mod tests {
             exclude: vec!["node_modules".to_string()],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         assert!(!is_new, "should be update, not new");
         assert_eq!(cfg.entries.len(), 1);
@@ -341,6 +352,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         cfg.add_entry(WatchEntry {
             path: "/tmp/b".into(),
@@ -350,6 +362,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         assert_eq!(cfg.entries.len(), 2);
 
@@ -408,6 +421,7 @@ mod tests {
             exclude: vec![".git".to_string(), "node_modules".to_string()],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
 
         let content = serde_json::to_string_pretty(&cfg).unwrap();
@@ -451,6 +465,7 @@ mod tests {
                 exclude: vec![],
                 max_content_bytes: None,
                 enabled: true,
+                use_global_ignore: true,
             });
         }
         assert_eq!(cfg.entries.len(), 5);
@@ -474,6 +489,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         assert!(cfg.entries[0].enabled);
 
@@ -495,6 +511,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         cfg.add_entry(WatchEntry {
             path: "/tmp/b".into(),
@@ -504,6 +521,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: false,
+            use_global_ignore: true,
         });
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -542,6 +560,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: true,
+            use_global_ignore: true,
         });
         cfg.add_entry(WatchEntry {
             path: "/tmp/b".into(),
@@ -551,6 +570,7 @@ mod tests {
             exclude: vec![],
             max_content_bytes: None,
             enabled: false,
+            use_global_ignore: true,
         });
         assert_eq!(cfg.enabled_count(), 1);
     }

@@ -303,22 +303,33 @@ fn read_tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<Stri
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
 
-    let chunk_size = 64 * 1024u64;
-    let start_pos = file_len.saturating_sub(chunk_size);
-    file.seek(SeekFrom::Start(start_pos))?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw)?;
-    let buf = String::from_utf8_lossy(&raw);
+    // Start with 64KB, double up to 1MB if we don't get enough lines
+    let mut chunk_size = 64 * 1024u64;
+    let max_chunk = 1024 * 1024u64;
 
-    let all_lines: Vec<&str> = buf.lines().collect();
-    // If we seeked into the middle, the first line may be partial
-    let tail = if start_pos > 0 && all_lines.len() > 1 {
-        &all_lines[1..]
-    } else {
-        &all_lines[..]
-    };
-    let start = tail.len().saturating_sub(n);
-    Ok(tail[start..].iter().map(|s| s.to_string()).collect())
+    loop {
+        let start_pos = file_len.saturating_sub(chunk_size);
+        file.seek(SeekFrom::Start(start_pos))?;
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)?;
+        let buf = String::from_utf8_lossy(&raw);
+
+        let all_lines: Vec<&str> = buf.lines().collect();
+        // If we seeked into the middle, the first line may be partial
+        let tail = if start_pos > 0 && all_lines.len() > 1 {
+            &all_lines[1..]
+        } else {
+            &all_lines[..]
+        };
+
+        // If we have enough lines or already reading from the start, return
+        if tail.len() >= n || start_pos == 0 || chunk_size >= max_chunk {
+            let start = tail.len().saturating_sub(n);
+            return Ok(tail[start..].iter().map(|s| s.to_string()).collect());
+        }
+
+        chunk_size = (chunk_size * 2).min(max_chunk);
+    }
 }
 
 // -- Entry point --
@@ -358,7 +369,11 @@ async fn main() -> Result<()> {
             let mut exclude_patterns = if no_global_ignore {
                 Vec::new()
             } else {
-                config::load_global_ignore()
+                let (patterns, warn) = config::load_global_ignore();
+                if let Some(warn) = warn {
+                    eprintln!("{warn}");
+                }
+                patterns
             };
             exclude_patterns.extend(exclude);
 
@@ -478,6 +493,7 @@ async fn main() -> Result<()> {
                     exclude,
                     max_content_bytes: max_size,
                     enabled: true,
+                    use_global_ignore: true,
                 });
                 cfg.save()?;
 

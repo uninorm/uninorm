@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use crate::config::{self, WatchConfig};
 use crate::error::DaemonError;
@@ -94,13 +95,29 @@ struct InitialScanEntry {
     recursive: bool,
     content: bool,
     follow_symlinks: bool,
-    globs: globset::GlobSet,
+    globs: Arc<globset::GlobSet>,
     max_content_bytes: u64,
 }
 
 /// Safety cap on directory walk depth to avoid excessive memory use with
 /// `contents_first(true)` on extremely deep trees.
 const MAX_WALK_DEPTH: usize = 256;
+
+/// Compile exclude patterns for a single entry, merging global ignore.
+/// Exposed for testing.
+pub fn compile_entry_excludes(
+    global_ignore: &[String],
+    entry_exclude: &[String],
+    use_global_ignore: bool,
+) -> (globset::GlobSet, Vec<String>) {
+    let mut patterns: Vec<String> = if use_global_ignore {
+        global_ignore.to_vec()
+    } else {
+        Vec::new()
+    };
+    patterns.extend(entry_exclude.iter().cloned());
+    uninorm_core::compile_excludes(&patterns)
+}
 
 /// Perform an initial scan of all watch entries, converting existing NFD files.
 /// Called once on daemon start (and on config reload) so that pre-existing files
@@ -217,9 +234,10 @@ fn cleanup_stale_temps(wc: &WatchConfig) {
 }
 
 /// Pre-compiled watch entry with glob set for efficient matching.
+/// Uses `Arc` so cloning for `spawn_blocking` closures is cheap.
 struct CompiledEntry<'a> {
     entry: &'a config::WatchEntry,
-    globs: globset::GlobSet,
+    globs: Arc<globset::GlobSet>,
 }
 
 /// Lightweight view for use inside spawn_blocking closures.
@@ -455,7 +473,10 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
         }
 
         // Load global ignore patterns and merge with per-entry excludes
-        let global_ignore = config::load_global_ignore();
+        let (global_ignore, global_warn) = config::load_global_ignore();
+        if let Some(warn) = global_warn {
+            append_log(&warn);
+        }
         if !global_ignore.is_empty() {
             append_log(&format!(
                 "Global ignore: {} patterns loaded",
@@ -469,17 +490,14 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
             .iter()
             .filter(|e| e.enabled)
             .map(|e| {
-                let mut patterns = global_ignore.clone();
-                patterns.extend(e.exclude.iter().cloned());
+                let (set, invalid) =
+                    compile_entry_excludes(&global_ignore, &e.exclude, e.use_global_ignore);
+                for pat in &invalid {
+                    append_log(&format!("Warning: invalid exclude pattern ignored: {pat}"));
+                }
                 CompiledEntry {
                     entry: e,
-                    globs: {
-                        let (set, invalid) = uninorm_core::compile_excludes(&patterns);
-                        for pat in &invalid {
-                            append_log(&format!("Warning: invalid exclude pattern ignored: {pat}"));
-                        }
-                        set
-                    },
+                    globs: Arc::new(set),
                 }
             })
             .collect();
@@ -622,7 +640,8 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
                     let mut handles = Vec::new();
                     for (_, dir_entries) in by_dir {
                         // Collect per-directory context
-                        let mut tasks: Vec<(PathBuf, bool, PathBuf, globset::GlobSet, bool, bool, u64)> = Vec::new();
+                        type EventTask = (PathBuf, bool, PathBuf, Arc<globset::GlobSet>, bool, bool, u64);
+                        let mut tasks: Vec<EventTask> = Vec::new();
                         for (path, is_name) in dir_entries {
                             let Some(ce) = find_entry_for_path(&path, compiled_ref) else {
                                 continue;

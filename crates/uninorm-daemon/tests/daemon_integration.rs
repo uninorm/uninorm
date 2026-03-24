@@ -204,6 +204,7 @@ fn test_config_roundtrip_with_all_fields() {
         exclude: vec!["*.log".to_string(), ".git".to_string()],
         max_content_bytes: Some(50 * 1024 * 1024),
         enabled: false,
+        use_global_ignore: true,
     });
 
     let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -310,6 +311,35 @@ fn test_convert_text_mixed_content() {
     let result = uninorm_core::convert_text(&mixed);
     let expected = format!("Hello {} world {}", nfc_korean(), nfc_korean());
     assert_eq!(result, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Daemon glob compilation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_compile_entry_excludes_merges_global_and_entry() {
+    let global = vec![".git".to_string(), "*.log".to_string()];
+    let entry = vec!["node_modules".to_string()];
+    let (set, invalid) = uninorm_daemon::daemon::compile_entry_excludes(&global, &entry, true);
+    assert!(invalid.is_empty());
+    assert!(set.is_match(".git"));
+    assert!(set.is_match("foo.log"));
+    assert!(set.is_match("node_modules"));
+    assert!(!set.is_match("foo.txt"));
+}
+
+#[test]
+fn test_compile_entry_excludes_skips_global_when_disabled() {
+    let global = vec![".git".to_string(), "*.log".to_string()];
+    let entry = vec!["node_modules".to_string()];
+    let (set, invalid) = uninorm_daemon::daemon::compile_entry_excludes(&global, &entry, false);
+    assert!(invalid.is_empty());
+    // Global patterns should NOT be applied
+    assert!(!set.is_match(".git"));
+    assert!(!set.is_match("foo.log"));
+    // Entry patterns should still apply
+    assert!(set.is_match("node_modules"));
 }
 
 #[test]
