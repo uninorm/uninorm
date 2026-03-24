@@ -178,7 +178,7 @@ fn test_config_save_load_with_autostart_status() {
     // autostart::is_installed() should not panic
     let installed = uninorm_daemon::autostart::is_installed();
     // Just verify it returns a bool without error
-    assert!(installed || !installed);
+    let _ = installed;
 }
 
 #[test]
@@ -192,8 +192,10 @@ fn test_controller_status_when_not_running() {
 
 #[test]
 fn test_config_roundtrip_with_all_fields() {
-    let mut cfg = uninorm_daemon::WatchConfig::default();
-    cfg.debounce_ms = Some(500);
+    let mut cfg = uninorm_daemon::WatchConfig {
+        debounce_ms: Some(500),
+        ..Default::default()
+    };
     cfg.add_entry(uninorm_daemon::WatchEntry {
         path: "/tmp/test_integration".into(),
         recursive: false,
