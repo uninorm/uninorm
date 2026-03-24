@@ -454,20 +454,33 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
             tokio::task::spawn_blocking(move || cleanup_stale_temps(&cfg_ref)).await?;
         }
 
+        // Load global ignore patterns and merge with per-entry excludes
+        let global_ignore = config::load_global_ignore();
+        if !global_ignore.is_empty() {
+            append_log(&format!(
+                "Global ignore: {} patterns loaded",
+                global_ignore.len()
+            ));
+        }
+
         // Pre-compile glob sets for enabled entries only
         let compiled: Vec<CompiledEntry<'_>> = watch_config
             .entries
             .iter()
             .filter(|e| e.enabled)
-            .map(|e| CompiledEntry {
-                entry: e,
-                globs: {
-                    let (set, invalid) = uninorm_core::compile_excludes(&e.exclude);
-                    for pat in &invalid {
-                        append_log(&format!("Warning: invalid exclude pattern ignored: {pat}"));
-                    }
-                    set
-                },
+            .map(|e| {
+                let mut patterns = global_ignore.clone();
+                patterns.extend(e.exclude.iter().cloned());
+                CompiledEntry {
+                    entry: e,
+                    globs: {
+                        let (set, invalid) = uninorm_core::compile_excludes(&patterns);
+                        for pat in &invalid {
+                            append_log(&format!("Warning: invalid exclude pattern ignored: {pat}"));
+                        }
+                        set
+                    },
+                }
             })
             .collect();
 

@@ -114,6 +114,30 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("uninorm.log"))
 }
 
+pub fn ignore_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("ignore"))
+}
+
+/// Load global ignore patterns from `~/.config/uninorm/ignore`.
+/// Returns an empty vec if the file does not exist.
+/// Format: one glob pattern per line, `#` for comments, blank lines ignored.
+pub fn load_global_ignore() -> Vec<String> {
+    let path = match ignore_path() {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
 pub fn read_pid() -> Option<u32> {
     let path = pid_path().ok()?;
     let content = std::fs::read_to_string(path).ok()?;
@@ -518,5 +542,43 @@ mod tests {
             enabled: false,
         });
         assert_eq!(cfg.enabled_count(), 1);
+    }
+
+    #[test]
+    fn test_load_global_ignore_parses_patterns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ignore_file = tmp.path().join("ignore");
+        fs::write(
+            &ignore_file,
+            "# comment\n\n.git\nnode_modules\n  *.pyc  \n# another comment\n",
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&ignore_file).unwrap();
+        let patterns: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(String::from)
+            .collect();
+
+        assert_eq!(patterns, vec![".git", "node_modules", "*.pyc"]);
+    }
+
+    #[test]
+    fn test_load_global_ignore_empty_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ignore_file = tmp.path().join("ignore");
+        fs::write(&ignore_file, "# only comments\n\n").unwrap();
+
+        let content = fs::read_to_string(&ignore_file).unwrap();
+        let patterns: Vec<String> = content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(String::from)
+            .collect();
+
+        assert!(patterns.is_empty());
     }
 }

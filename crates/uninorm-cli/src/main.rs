@@ -56,6 +56,10 @@ enum Commands {
         /// Maximum file size for content conversion (e.g. 50MB, 1GB). Default: 100MB
         #[arg(long, value_name = "SIZE", value_parser = parse_size)]
         max_size: Option<u64>,
+
+        /// Do not apply global ignore patterns (~/.config/uninorm/ignore)
+        #[arg(long)]
+        no_global_ignore: bool,
     },
 
     /// Manage background file watching (add/remove/start/stop watch entries)
@@ -345,10 +349,18 @@ async fn main() -> Result<()> {
             yes,
             verbose,
             max_size,
+            no_global_ignore,
         } => {
             if !path.exists() {
                 anyhow::bail!("Path does not exist: {}", path.display());
             }
+
+            let mut exclude_patterns = if no_global_ignore {
+                Vec::new()
+            } else {
+                config::load_global_ignore()
+            };
+            exclude_patterns.extend(exclude);
 
             let opts = ConversionOptions {
                 convert_filenames: true,
@@ -356,7 +368,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 recursive: !no_recursive,
                 follow_symlinks,
-                exclude_patterns: exclude,
+                exclude_patterns,
                 max_content_bytes: max_size.unwrap_or(DEFAULT_MAX_CONTENT_BYTES),
             };
 
