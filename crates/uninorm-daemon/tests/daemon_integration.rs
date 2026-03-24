@@ -318,3 +318,119 @@ fn test_is_nfc_detection() {
     assert!(uninorm_core::is_nfc(&nfc_korean()));
     assert!(uninorm_core::is_nfc("plain ascii"));
 }
+
+// ---------------------------------------------------------------------------
+// Global ignore integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_global_ignore_patterns_skip_matching_files() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Create NFD files: one .log (should be ignored) and one .txt (should convert)
+    let nfd_log = format!("{}.log", nfd_korean());
+    let nfd_txt = format!("{}.txt", nfd_korean());
+    fs::write(tmp.path().join(&nfd_log), "log").unwrap();
+    fs::write(tmp.path().join(&nfd_txt), "text").unwrap();
+
+    // Simulate global ignore merged with exclude_patterns
+    let global_ignore = vec!["*.log".to_string()];
+
+    let opts = uninorm_core::ConversionOptions {
+        convert_filenames: true,
+        convert_content: false,
+        dry_run: false,
+        recursive: true,
+        follow_symlinks: false,
+        exclude_patterns: global_ignore,
+        max_content_bytes: uninorm_core::DEFAULT_MAX_CONTENT_BYTES,
+    };
+
+    let stats = uninorm_core::convert_path(tmp.path(), &opts, |_| {}).await;
+    assert!(stats.is_ok());
+    let stats = stats.unwrap();
+
+    // .log file should be skipped, .txt should be renamed
+    assert_eq!(stats.files_renamed, 1, "only .txt should be renamed");
+    assert!(
+        tmp.path().join(&nfd_log).exists(),
+        ".log file should remain unchanged"
+    );
+    let nfc_txt = format!("{}.txt", nfc_korean());
+    assert!(
+        tmp.path().join(&nfc_txt).exists(),
+        ".txt file should be renamed to NFC"
+    );
+}
+
+#[tokio::test]
+async fn test_no_global_ignore_converts_all_files() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Create NFD .log file that would normally be ignored
+    let nfd_log = format!("{}.log", nfd_korean());
+    fs::write(tmp.path().join(&nfd_log), "log").unwrap();
+
+    // Simulate --no-global-ignore: empty exclude_patterns
+    let opts = uninorm_core::ConversionOptions {
+        convert_filenames: true,
+        convert_content: false,
+        dry_run: false,
+        recursive: true,
+        follow_symlinks: false,
+        exclude_patterns: vec![],
+        max_content_bytes: uninorm_core::DEFAULT_MAX_CONTENT_BYTES,
+    };
+
+    let stats = uninorm_core::convert_path(tmp.path(), &opts, |_| {}).await;
+    assert!(stats.is_ok());
+    let stats = stats.unwrap();
+
+    assert_eq!(
+        stats.files_renamed, 1,
+        "without global ignore, .log should also be renamed"
+    );
+    let nfc_log = format!("{}.log", nfc_korean());
+    assert!(tmp.path().join(&nfc_log).exists());
+}
+
+#[tokio::test]
+async fn test_global_ignore_merged_with_entry_exclude() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Create NFD files of different types
+    let nfd_log = format!("{}.log", nfd_korean());
+    let nfd_tmp = format!("{}.tmp", nfd_korean());
+    let nfd_txt = format!("{}.txt", nfd_korean());
+    fs::write(tmp.path().join(&nfd_log), "log").unwrap();
+    fs::write(tmp.path().join(&nfd_tmp), "tmp").unwrap();
+    fs::write(tmp.path().join(&nfd_txt), "txt").unwrap();
+
+    // Simulate global ignore (*.log) + per-entry exclude (*.tmp)
+    let mut patterns = vec!["*.log".to_string()]; // global
+    patterns.push("*.tmp".to_string()); // per-entry
+
+    let opts = uninorm_core::ConversionOptions {
+        convert_filenames: true,
+        convert_content: false,
+        dry_run: false,
+        recursive: true,
+        follow_symlinks: false,
+        exclude_patterns: patterns,
+        max_content_bytes: uninorm_core::DEFAULT_MAX_CONTENT_BYTES,
+    };
+
+    let stats = uninorm_core::convert_path(tmp.path(), &opts, |_| {}).await;
+    assert!(stats.is_ok());
+    let stats = stats.unwrap();
+
+    // Only .txt should be renamed
+    assert_eq!(
+        stats.files_renamed, 1,
+        "only .txt should be renamed (both .log and .tmp excluded)"
+    );
+    assert!(tmp.path().join(&nfd_log).exists(), ".log should remain");
+    assert!(tmp.path().join(&nfd_tmp).exists(), ".tmp should remain");
+    let nfc_txt = format!("{}.txt", nfc_korean());
+    assert!(tmp.path().join(&nfc_txt).exists(), ".txt should be NFC");
+}
