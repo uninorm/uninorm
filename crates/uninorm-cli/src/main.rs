@@ -60,6 +60,10 @@ enum Commands {
         /// Do not apply global ignore patterns (~/.config/uninorm/ignore)
         #[arg(long)]
         no_global_ignore: bool,
+
+        /// Output results as JSON (for scripting)
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage background file watching (add/remove/start/stop watch entries)
@@ -195,59 +199,14 @@ enum DaemonAction {
 
 // -- Helpers --
 
-/// Parse comma-separated 1-based indices (e.g. "1,3,5") and validate against entry count.
-/// Returns sorted, deduplicated 0-based indices.
+/// Parse comma-separated 1-based indices, delegating to lib.
 fn parse_indices(s: &str, count: usize) -> Result<Vec<usize>> {
-    let mut indices = Vec::new();
-    for part in s.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let n: usize = part
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid number: {part}"))?;
-        if n == 0 || n > count {
-            anyhow::bail!(
-                "Entry #{n} does not exist. Use `uninorm watch list` to see entries (1-{count})."
-            );
-        }
-        indices.push(n - 1);
-    }
-    indices.sort_unstable();
-    indices.dedup();
-    if indices.is_empty() {
-        anyhow::bail!("No entry numbers provided.");
-    }
-    Ok(indices)
+    uninorm::parse_indices(s, count).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Parse human-readable size strings like "100MB", "1GB", "500KB", or raw bytes.
+/// Parse human-readable size strings, delegating to lib.
 fn parse_size(s: &str) -> std::result::Result<u64, String> {
-    let s = s.trim().to_uppercase();
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("GB") {
-        (n, 1024 * 1024 * 1024u64)
-    } else if let Some(n) = s.strip_suffix("MB") {
-        (n, 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("KB") {
-        (n, 1024)
-    } else if let Some(n) = s.strip_suffix('B') {
-        (n, 1)
-    } else {
-        (s.as_str(), 1)
-    };
-    let num: f64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("Invalid size: {s}"))?;
-    if !num.is_finite() || num <= 0.0 {
-        return Err(format!("Invalid size: {s}"));
-    }
-    let result = num * multiplier as f64;
-    if result > u64::MAX as f64 {
-        return Err(format!("Size too large: {s}"));
-    }
-    Ok(result as u64)
+    uninorm::parse_size(s)
 }
 
 fn make_spinner() -> ProgressBar {
@@ -286,15 +245,7 @@ fn print_stats(stats: &ConversionStats, dry_run: bool) {
 }
 
 fn format_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{}MB", bytes / (1024 * 1024))
-    } else if bytes >= 1024 {
-        format!("{}KB", bytes / 1024)
-    } else {
-        format!("{bytes}B")
-    }
+    uninorm::format_size(bytes)
 }
 
 /// Read the last N lines from a file without loading the entire file.
@@ -361,6 +312,7 @@ async fn main() -> Result<()> {
             verbose,
             max_size,
             no_global_ignore,
+            json,
         } => {
             if !path.exists() {
                 anyhow::bail!("Path does not exist: {}", path.display());
@@ -388,54 +340,80 @@ async fn main() -> Result<()> {
             };
 
             // Pre-scan
-            let scan_pb = make_spinner();
-            scan_pb.set_message("Scanning...");
+            let scan_pb = if json {
+                ProgressBar::hidden()
+            } else {
+                let pb = make_spinner();
+                pb.set_message("Scanning...");
+                pb
+            };
             let scan = uninorm_core::scan_path(&path, &opts).await;
             scan_pb.finish_and_clear();
 
-            println!(
-                "Scanned {} entries under {}",
-                scan.total_scanned,
-                path.display()
-            );
+            if !json {
+                println!(
+                    "Scanned {} entries under {}",
+                    scan.total_scanned,
+                    path.display()
+                );
 
-            if !scan.errors.is_empty() {
-                eprintln!("Scan errors ({}):", scan.errors.len());
-                for e in &scan.errors {
-                    eprintln!("  - {e}");
+                if !scan.errors.is_empty() {
+                    eprintln!("Scan errors ({}):", scan.errors.len());
+                    for e in &scan.errors {
+                        eprintln!("  - {e}");
+                    }
                 }
             }
 
             if scan.affected_count() == 0 {
-                println!("No NFD entries found -- nothing to do.");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "path": path.display().to_string(),
+                            "dry_run": dry_run,
+                            "scanned": scan.total_scanned,
+                            "affected": 0,
+                            "renamed": 0,
+                            "content_converted": 0,
+                            "skipped": 0,
+                            "errors": scan.errors,
+                        })
+                    );
+                } else {
+                    println!("No NFD entries found -- nothing to do.");
+                }
                 return Ok(());
             }
 
             let rename_count = scan.rename_count();
             let content_count = scan.content_count();
 
-            if rename_count > 0 {
-                println!("  Filenames to rename:  {rename_count}");
-            }
-            if content_count > 0 {
-                println!("  Files with NFD content: {content_count}");
-            }
+            if !json {
+                if rename_count > 0 {
+                    println!("  Filenames to rename:  {rename_count}");
+                }
+                if content_count > 0 {
+                    println!("  Files with NFD content: {content_count}");
+                }
 
-            if verbose {
-                println!();
-                for entry in &scan.entries {
-                    if entry.needs_rename {
-                        let old = entry.path.file_name().unwrap_or_default().to_string_lossy();
-                        let new = entry.new_name.as_deref().unwrap_or("?");
-                        println!("  rename: {} -> {}", old, new);
-                    }
-                    if entry.needs_content_conversion {
-                        println!("  content: {}", entry.path.display());
+                if verbose {
+                    println!();
+                    for entry in &scan.entries {
+                        if entry.needs_rename {
+                            let old = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                            let new = entry.new_name.as_deref().unwrap_or("?");
+                            println!("  rename: {} -> {}", old, new);
+                        }
+                        if entry.needs_content_conversion {
+                            println!("  content: {}", entry.path.display());
+                        }
                     }
                 }
             }
 
-            if !dry_run && !yes {
+            // JSON mode implies --yes (no confirmation)
+            if !dry_run && !yes && !json {
                 println!();
                 if !confirm("Proceed with conversion?") {
                     println!("Aborted.");
@@ -443,11 +421,15 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if dry_run {
+            if dry_run && !json {
                 println!("\n[dry-run] No files will be modified.");
             }
 
-            let pb = make_spinner();
+            let pb = if json {
+                ProgressBar::hidden()
+            } else {
+                make_spinner()
+            };
             let stats = uninorm_core::convert_path(&path, &opts, |s: &ConversionStats| {
                 pb.set_message(format!(
                     "Scanned: {}  Renamed: {}  Content: {}",
@@ -457,9 +439,29 @@ async fn main() -> Result<()> {
             .await?;
 
             pb.finish_and_clear();
-            print_stats(&stats, dry_run);
-            if !stats.errors.is_empty() {
-                std::process::exit(1);
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "dry_run": dry_run,
+                        "scanned": stats.files_scanned,
+                        "directories": stats.directories_scanned,
+                        "renamed": stats.files_renamed,
+                        "content_converted": stats.files_content_converted,
+                        "skipped": stats.files_skipped,
+                        "errors": stats.errors,
+                    })
+                );
+                if !stats.errors.is_empty() {
+                    std::process::exit(1);
+                }
+            } else {
+                print_stats(&stats, dry_run);
+                if !stats.errors.is_empty() {
+                    std::process::exit(1);
+                }
             }
         }
 
