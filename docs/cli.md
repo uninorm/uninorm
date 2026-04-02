@@ -188,6 +188,7 @@ uninorm convert [TEXT] [OPTIONS]
 | Flag | Description |
 |---|---|
 | `-c / --clipboard` | Copy result to clipboard |
+| `--json` | Output result as JSON |
 
 **Examples**
 
@@ -195,6 +196,7 @@ uninorm convert [TEXT] [OPTIONS]
 uninorm convert "NFD text"
 echo "NFD text" | uninorm convert
 uninorm convert -c "text"   # convert and copy to clipboard
+uninorm convert --json "NFD text"   # {"input":"...","output":"...","changed":true}
 ```
 
 ---
@@ -222,8 +224,12 @@ uninorm clipboard
 Check whether a string is already NFC-normalized. Exits with code `1` if it is not.
 
 ```
-uninorm check <TEXT>
+uninorm check <TEXT> [OPTIONS]
 ```
+
+| Flag | Description |
+|---|---|
+| `--json` | Output result as JSON |
 
 **Examples**
 

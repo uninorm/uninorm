@@ -185,6 +185,7 @@ uninorm convert [텍스트] [옵션]
 | 플래그 | 설명 |
 |---|---|
 | `-c / --clipboard` | 변환 결과를 클립보드에 복사 |
+| `--json` | 결과를 JSON으로 출력 |
 
 **예시**
 
@@ -192,6 +193,7 @@ uninorm convert [텍스트] [옵션]
 uninorm convert "NFD 텍스트"
 echo "NFD 텍스트" | uninorm convert
 uninorm convert -c "텍스트"   # 변환 후 클립보드에 복사
+uninorm convert --json "NFD 텍스트"   # {"input":"...","output":"...","changed":true}
 ```
 
 ---
@@ -219,8 +221,12 @@ uninorm clipboard
 문자열이 이미 NFC로 정규화되어 있는지 확인합니다. NFC가 아니면 종료 코드 `1`을 반환합니다.
 
 ```
-uninorm check <텍스트>
+uninorm check <텍스트> [옵션]
 ```
+
+| 플래그 | 설명 |
+|---|---|
+| `--json` | 결과를 JSON으로 출력 |
 
 **예시**
 
