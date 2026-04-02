@@ -2,6 +2,21 @@ use unicode_normalization::UnicodeNormalization;
 
 /// Convert text content from NFD to NFC.
 /// Use this for file contents (standard Unicode NFD).
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::to_nfc;
+///
+/// // Latin é in NFD (e + combining acute) → NFC (precomposed é)
+/// assert_eq!(to_nfc("cafe\u{0301}"), "café");
+///
+/// // Already NFC text passes through unchanged
+/// assert_eq!(to_nfc("hello world"), "hello world");
+///
+/// // Korean Hangul jamo → precomposed syllable
+/// assert_eq!(to_nfc("\u{1100}\u{1161}\u{11BC}"), "강");
+/// ```
 pub fn to_nfc(s: &str) -> String {
     s.nfc().collect()
 }
@@ -13,6 +28,18 @@ pub fn to_nfc(s: &str) -> String {
 ///
 /// On Linux/Windows: uses standard Unicode NFC normalization, which is correct
 /// for those filesystems (ext4, NTFS, etc. store filenames as-is).
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::to_nfc_filename;
+///
+/// // Latin diacritics
+/// assert_eq!(to_nfc_filename("re\u{0301}sume\u{0301}.pdf"), "résumé.pdf");
+///
+/// // ASCII filenames pass through unchanged
+/// assert_eq!(to_nfc_filename("readme.md"), "readme.md");
+/// ```
 pub fn to_nfc_filename(s: &str) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -26,11 +53,31 @@ pub fn to_nfc_filename(s: &str) -> String {
 }
 
 /// Returns true if the string is already in NFC form.
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::is_nfc;
+///
+/// assert!(is_nfc("café"));       // precomposed NFC
+/// assert!(is_nfc("hello"));      // pure ASCII
+/// assert!(!is_nfc("e\u{0301}")); // NFD decomposed é
+/// ```
 pub fn is_nfc(s: &str) -> bool {
     unicode_normalization::is_nfc(s)
 }
 
 /// Returns true if the filename needs NFD → NFC conversion.
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::needs_filename_conversion;
+///
+/// assert!(needs_filename_conversion("e\u{0301}"));  // NFD é
+/// assert!(!needs_filename_conversion("café"));       // already NFC
+/// assert!(!needs_filename_conversion("hello.txt"));  // pure ASCII
+/// ```
 pub fn needs_filename_conversion(s: &str) -> bool {
     to_nfc_filename(s) != s
 }
@@ -294,5 +341,25 @@ mod tests {
         let s = "123 !@#$%^&*()_+-=[]{}|;':\",./<>?";
         assert_eq!(to_nfc(s), s);
         assert!(!needs_filename_conversion(s));
+    }
+
+    // ── Singleton decomposition ───────────────────────────────────────────────
+
+    #[test]
+    fn test_singleton_decomposition() {
+        // U+2126 OHM SIGN normalizes to U+03A9 GREEK CAPITAL LETTER OMEGA
+        assert_eq!(to_nfc("\u{2126}"), "\u{03A9}");
+        assert!(!is_nfc("\u{2126}"));
+    }
+
+    // ── Multiple combining marks ──────────────────────────────────────────────
+
+    #[test]
+    fn test_multiple_combining_marks() {
+        // ệ = e + combining circumflex + combining dot below
+        let nfd = "e\u{0302}\u{0323}";
+        let nfc = to_nfc(nfd);
+        assert!(is_nfc(&nfc));
+        assert_ne!(nfc, nfd);
     }
 }
