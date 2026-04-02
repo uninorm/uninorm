@@ -11,6 +11,9 @@ use walkdir::WalkDir;
 /// Default maximum file size for content conversion (100 MB).
 pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Maximum directory traversal depth for recursive walks.
+pub const MAX_WALK_DEPTH: usize = 256;
+
 /// Global atomic counter for unique temp file names.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -28,6 +31,19 @@ pub fn temp_name() -> String {
 /// Compile exclude patterns into a `GlobSet` for efficient matching.
 /// Supports both exact names (e.g. `.git`) and glob patterns (e.g. `*.log`, `build*`).
 /// Returns `(GlobSet, Vec<String>)` where the second element contains any invalid patterns.
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::compile_excludes;
+///
+/// let patterns = vec![".git".to_string(), "*.log".to_string()];
+/// let (globs, invalid) = compile_excludes(&patterns);
+/// assert!(invalid.is_empty());
+/// assert!(globs.is_match(".git"));
+/// assert!(globs.is_match("app.log"));
+/// assert!(!globs.is_match("readme.md"));
+/// ```
 pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
     let mut builder = GlobSetBuilder::new();
     let mut invalid = Vec::new();
@@ -51,6 +67,19 @@ pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
 
 /// Check if a path should be excluded based on compiled glob patterns.
 /// Matches against each component of the relative path (from root).
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use uninorm_core::{compile_excludes, is_excluded};
+///
+/// let patterns = vec![".git".to_string(), "*.log".to_string()];
+/// let (globs, _) = compile_excludes(&patterns);
+///
+/// assert!(is_excluded(Path::new("/root/.git/config"), Path::new("/root"), &globs));
+/// assert!(!is_excluded(Path::new("/root/src/main.rs"), Path::new("/root"), &globs));
+/// ```
 pub fn is_excluded(entry_path: &Path, root: &Path, globs: &GlobSet) -> bool {
     if globs.is_empty() {
         return false;
@@ -132,10 +161,33 @@ impl Default for ConversionOptions {
 
 #[derive(Debug, Default)]
 pub struct ConversionStats {
+    /// Total entries scanned (files + directories).
     pub files_scanned: usize,
     pub files_renamed: usize,
     pub files_content_converted: usize,
+    /// Files skipped due to binary content, size limits, or non-UTF-8 encoding.
+    pub files_skipped: usize,
+    /// Number of directories encountered during traversal.
+    pub directories_scanned: usize,
     pub errors: Vec<String>,
+}
+
+impl std::fmt::Display for ConversionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Scanned: {} (dirs: {})  Renamed: {}  Content: {}  Skipped: {}",
+            self.files_scanned,
+            self.directories_scanned,
+            self.files_renamed,
+            self.files_content_converted,
+            self.files_skipped,
+        )?;
+        if !self.errors.is_empty() {
+            write!(f, "  Errors: {}", self.errors.len())?;
+        }
+        Ok(())
+    }
 }
 
 /// Collected entry for depth-grouped parallel processing.
@@ -161,7 +213,7 @@ pub async fn convert_path(
             .errors
             .push(format!("Warning: invalid exclude pattern ignored: {pat}"));
     }
-    let max_depth = if opts.recursive { usize::MAX } else { 1 };
+    let max_depth = if opts.recursive { MAX_WALK_DEPTH } else { 1 };
 
     let walker = WalkDir::new(path)
         .follow_links(opts.follow_symlinks)
@@ -183,10 +235,14 @@ pub async fn convert_path(
             continue;
         }
 
+        let is_file = entry.file_type().is_file();
+        if !is_file {
+            stats.directories_scanned += 1;
+        }
         stats.files_scanned += 1;
         entries.push(CollectedEntry {
             path: entry.path().to_path_buf(),
-            is_file: entry.file_type().is_file(),
+            is_file,
         });
     }
 
@@ -291,6 +347,7 @@ async fn convert_single_content(
     match tokio::fs::metadata(path).await {
         Ok(meta) => {
             if meta.len() > max_bytes {
+                stats.files_skipped += 1;
                 return Ok(());
             }
         }
@@ -338,7 +395,9 @@ async fn convert_single_content(
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            stats.files_skipped += 1;
+        }
         Err(e) => {
             return Err(format!("Content read failed {}: {e}", path.display()));
         }
@@ -392,7 +451,7 @@ pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
             .errors
             .push(format!("Invalid exclude pattern ignored: {pat}"));
     }
-    let max_depth = if opts.recursive { usize::MAX } else { 1 };
+    let max_depth = if opts.recursive { MAX_WALK_DEPTH } else { 1 };
     let walker = WalkDir::new(path)
         .follow_links(opts.follow_symlinks)
         .contents_first(true)
@@ -489,6 +548,15 @@ pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
 }
 
 /// Convert a single string (e.g. from clipboard) from NFD to NFC.
+///
+/// # Examples
+///
+/// ```
+/// use uninorm_core::convert_text;
+///
+/// assert_eq!(convert_text("cafe\u{0301}"), "café");
+/// assert_eq!(convert_text("already NFC"), "already NFC");
+/// ```
 pub fn convert_text(s: &str) -> String {
     to_nfc(s)
 }
@@ -527,6 +595,126 @@ mod tests {
         // が in NFD
         let nfd = "\u{304B}\u{3099}";
         assert_eq!(convert_text(nfd), "が");
+    }
+
+    // ── ConversionStats Display ────────────────────────────────────────────
+
+    #[test]
+    fn test_stats_display_no_errors() {
+        let stats = ConversionStats {
+            files_scanned: 100,
+            files_renamed: 5,
+            files_content_converted: 3,
+            files_skipped: 2,
+            directories_scanned: 10,
+            errors: vec![],
+        };
+        let display = format!("{stats}");
+        assert!(display.contains("Scanned: 100"));
+        assert!(display.contains("dirs: 10"));
+        assert!(display.contains("Renamed: 5"));
+        assert!(display.contains("Content: 3"));
+        assert!(display.contains("Skipped: 2"));
+        assert!(!display.contains("Errors"));
+    }
+
+    #[test]
+    fn test_stats_display_with_errors() {
+        let stats = ConversionStats {
+            files_scanned: 50,
+            errors: vec!["error1".to_string(), "error2".to_string()],
+            ..ConversionStats::default()
+        };
+        let display = format!("{stats}");
+        assert!(display.contains("Errors: 2"));
+    }
+
+    #[test]
+    fn test_stats_default() {
+        let stats = ConversionStats::default();
+        assert_eq!(stats.files_skipped, 0);
+        assert_eq!(stats.directories_scanned, 0);
+    }
+
+    // ── files_skipped and directories_scanned ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_files_skipped_for_large_content() {
+        let dir = TempDir::new().unwrap();
+        // Write a file larger than max_content_bytes (10 bytes)
+        fs::write(
+            dir.path().join("large.txt"),
+            "this content is more than ten bytes long",
+        )
+        .unwrap();
+
+        let opts = ConversionOptions {
+            convert_filenames: false,
+            convert_content: true,
+            dry_run: false,
+            recursive: false,
+            follow_symlinks: false,
+            max_content_bytes: 10,
+            ..ConversionOptions::default()
+        };
+
+        let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
+        assert!(
+            stats.files_skipped >= 1,
+            "expected files_skipped >= 1, got {}",
+            stats.files_skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn test_files_skipped_for_binary_content() {
+        let dir = TempDir::new().unwrap();
+        // Write invalid UTF-8 bytes (binary file)
+        fs::write(dir.path().join("binary.bin"), [0xFF, 0xFE, 0x80, 0x81]).unwrap();
+
+        let opts = ConversionOptions {
+            convert_filenames: false,
+            convert_content: true,
+            dry_run: false,
+            recursive: false,
+            follow_symlinks: false,
+            ..ConversionOptions::default()
+        };
+
+        let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
+        assert!(
+            stats.files_skipped >= 1,
+            "expected files_skipped >= 1 for binary file, got {}",
+            stats.files_skipped
+        );
+    }
+
+    #[tokio::test]
+    async fn test_directories_scanned_count() {
+        let dir = TempDir::new().unwrap();
+        // Create 2 subdirectories with files
+        let sub1 = dir.path().join("subdir1");
+        let sub2 = dir.path().join("subdir2");
+        fs::create_dir(&sub1).unwrap();
+        fs::create_dir(&sub2).unwrap();
+        fs::write(sub1.join("file1.txt"), "hello").unwrap();
+        fs::write(sub2.join("file2.txt"), "world").unwrap();
+
+        let opts = ConversionOptions {
+            convert_filenames: false,
+            convert_content: false,
+            dry_run: false,
+            recursive: true,
+            follow_symlinks: false,
+            ..ConversionOptions::default()
+        };
+
+        let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
+        assert!(
+            stats.directories_scanned >= 2,
+            "expected directories_scanned >= 2, got {}",
+            stats.directories_scanned
+        );
     }
 
     // ── ConversionOptions defaults ────────────────────────────────────────────
@@ -1620,5 +1808,23 @@ mod tests {
         assert_eq!(result.rename_count(), 2);
         assert_eq!(result.content_count(), 2);
         assert_eq!(result.affected_count(), 3);
+    }
+
+    // ── compile_excludes() ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_compile_excludes_with_invalid_pattern() {
+        let patterns = vec!["[invalid".to_string(), ".git".to_string()];
+        let (globs, invalid) = compile_excludes(&patterns);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0], "[invalid");
+        assert!(globs.is_match(".git"));
+    }
+
+    #[test]
+    fn test_compile_excludes_empty() {
+        let (globs, invalid) = compile_excludes(&[]);
+        assert!(invalid.is_empty());
+        assert!(globs.is_empty());
     }
 }
