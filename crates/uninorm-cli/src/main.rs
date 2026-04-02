@@ -80,7 +80,11 @@ enum Commands {
     },
 
     /// Show watcher status (daemon PID, watched paths, recent activity)
-    Status,
+    Status {
+        /// Output status as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Manage autostart (on/off) — register daemon to start on login
     Autostart {
@@ -643,43 +647,59 @@ async fn main() -> Result<()> {
         }
 
         // -- status: show daemon status + summary --
-        Commands::Status => {
-            match DaemonController::status() {
-                Some(pid) => println!("Daemon running (PID {pid})"),
-                None => {
-                    if let Some(pid) = config::read_pid() {
-                        println!("Daemon not running (stale PID {pid})");
-                        config::remove_pid();
-                    } else {
-                        println!("Daemon not running.");
-                    }
-                }
-            }
-
-            if uninorm_daemon::autostart::is_installed() {
-                println!("Autostart: on");
-            } else {
-                println!("Autostart: off (run `uninorm autostart on` to enable)");
-            }
-
+        Commands::Status { json } => {
+            let daemon_pid = DaemonController::status();
+            let autostart = uninorm_daemon::autostart::is_installed();
             let cfg = config::WatchConfig::load()?;
             let total = cfg.entries.len();
             let enabled = cfg.enabled_count();
-            if total > 0 {
-                println!("Watch entries: {enabled}/{total} enabled");
-                println!("Use `uninorm watch list` for details.");
-            } else {
-                println!("No watch entries configured.");
-            }
 
-            // Show last 5 log lines
-            if let Ok(log) = config::log_path() {
-                if log.exists() {
-                    if let Ok(recent) = read_tail_lines(&log, 5) {
-                        if !recent.is_empty() {
-                            println!("\nRecent activity:");
-                            for l in &recent {
-                                println!("  {l}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "daemon_running": daemon_pid.is_some(),
+                        "daemon_pid": daemon_pid,
+                        "autostart": autostart,
+                        "watch_entries_total": total,
+                        "watch_entries_enabled": enabled,
+                    })
+                );
+            } else {
+                match daemon_pid {
+                    Some(pid) => println!("Daemon running (PID {pid})"),
+                    None => {
+                        if let Some(pid) = config::read_pid() {
+                            println!("Daemon not running (stale PID {pid})");
+                            config::remove_pid();
+                        } else {
+                            println!("Daemon not running.");
+                        }
+                    }
+                }
+
+                if autostart {
+                    println!("Autostart: on");
+                } else {
+                    println!("Autostart: off (run `uninorm autostart on` to enable)");
+                }
+
+                if total > 0 {
+                    println!("Watch entries: {enabled}/{total} enabled");
+                    println!("Use `uninorm watch list` for details.");
+                } else {
+                    println!("No watch entries configured.");
+                }
+
+                // Show last 5 log lines
+                if let Ok(log) = config::log_path() {
+                    if log.exists() {
+                        if let Ok(recent) = read_tail_lines(&log, 5) {
+                            if !recent.is_empty() {
+                                println!("\nRecent activity:");
+                                for l in &recent {
+                                    println!("  {l}");
+                                }
                             }
                         }
                     }
