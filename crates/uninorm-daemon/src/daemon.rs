@@ -99,10 +99,6 @@ struct InitialScanEntry {
     max_content_bytes: u64,
 }
 
-/// Safety cap on directory walk depth to avoid excessive memory use with
-/// `contents_first(true)` on extremely deep trees.
-const MAX_WALK_DEPTH: usize = 256;
-
 /// Compile exclude patterns for a single entry, merging global ignore.
 /// Exposed for testing.
 pub fn compile_entry_excludes(
@@ -125,7 +121,11 @@ pub fn compile_entry_excludes(
 /// Messages are streamed via `log` callback to avoid unbounded memory growth.
 fn initial_scan(entries: Vec<InitialScanEntry>, log: impl Fn(&str)) {
     for entry in &entries {
-        let max_depth = if entry.recursive { MAX_WALK_DEPTH } else { 1 };
+        let max_depth = if entry.recursive {
+            uninorm_core::MAX_WALK_DEPTH
+        } else {
+            1
+        };
         let mut rename_count = 0usize;
         let mut content_count = 0usize;
 
@@ -206,7 +206,11 @@ fn initial_scan(entries: Vec<InitialScanEntry>, log: impl Fn(&str)) {
 fn cleanup_stale_temps(wc: &WatchConfig) {
     for entry in wc.entries.iter().filter(|e| e.enabled) {
         let walker = walkdir::WalkDir::new(&entry.path)
-            .max_depth(if entry.recursive { MAX_WALK_DEPTH } else { 1 })
+            .max_depth(if entry.recursive {
+                uninorm_core::MAX_WALK_DEPTH
+            } else {
+                1
+            })
             .follow_links(entry.follow_symlinks);
         for dir_entry in walker.into_iter().flatten() {
             if let Some(name) = dir_entry.file_name().to_str() {
