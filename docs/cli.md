@@ -43,6 +43,7 @@ uninorm files <PATH> [OPTIONS]
 | `--no-global-ignore` | false | Do not apply global ignore patterns |
 | `-y / --yes` | false | Skip confirmation prompt |
 | `-v / --verbose` | false | Show individual file changes |
+| `--json` | false | Output results as JSON (for scripting/CI) |
 
 **Examples**
 
@@ -61,6 +62,9 @@ uninorm files ~/project --exclude .git --exclude node_modules
 
 # Single file
 uninorm files ~/Downloads/한글파일.txt
+
+# JSON output for scripting/CI
+uninorm files ~/Downloads --json --yes
 ```
 
 **Output**

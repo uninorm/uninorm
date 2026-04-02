@@ -43,6 +43,7 @@ uninorm files <경로> [옵션]
 | `--no-global-ignore` | false | 글로벌 ignore 패턴 적용 안함 |
 | `-y / --yes` | false | 확인 프롬프트 건너뛰기 |
 | `-v / --verbose` | false | 개별 파일 변경 사항 표시 |
+| `--json` | false | 결과를 JSON으로 출력 (스크립팅/CI용) |
 
 **예시**
 
