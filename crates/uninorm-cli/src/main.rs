@@ -101,6 +101,10 @@ enum Commands {
     Check {
         /// Text to check
         text: String,
+
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Convert TEXT from NFD to NFC and print the result (reads stdin if no text given)
@@ -111,6 +115,10 @@ enum Commands {
         /// Copy result to clipboard
         #[arg(short = 'c', long)]
         clipboard: bool,
+
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Internal: run as background daemon process
@@ -701,8 +709,21 @@ async fn main() -> Result<()> {
         }
 
         // -- check --
-        Commands::Check { text } => {
-            if uninorm_core::is_nfc(&text) {
+        Commands::Check { text, json } => {
+            let is_nfc = uninorm_core::is_nfc(&text);
+            if json {
+                let mut obj = serde_json::json!({
+                    "input": text,
+                    "is_nfc": is_nfc,
+                });
+                if !is_nfc {
+                    obj["nfc"] = serde_json::Value::String(uninorm_core::convert_text(&text));
+                }
+                println!("{obj}");
+                if !is_nfc {
+                    std::process::exit(1);
+                }
+            } else if is_nfc {
                 println!("Already NFC");
             } else {
                 let nfc = uninorm_core::convert_text(&text);
@@ -712,7 +733,11 @@ async fn main() -> Result<()> {
         }
 
         // -- convert --
-        Commands::Convert { text, clipboard } => {
+        Commands::Convert {
+            text,
+            clipboard,
+            json,
+        } => {
             let input = match text {
                 Some(t) => t,
                 None => {
@@ -726,20 +751,32 @@ async fn main() -> Result<()> {
             };
 
             let nfc = uninorm_core::convert_text(&input);
+            let changed = nfc != input;
 
-            if nfc == input {
-                print!("{nfc}");
-                eprintln!("(already NFC)");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "input": input,
+                        "output": nfc,
+                        "changed": changed,
+                    })
+                );
             } else {
-                print!("{nfc}");
-            }
+                if changed {
+                    print!("{nfc}");
+                } else {
+                    print!("{nfc}");
+                    eprintln!("(already NFC)");
+                }
 
-            if clipboard {
-                let mut cb = arboard::Clipboard::new()
-                    .map_err(|e| anyhow::anyhow!("Failed to open clipboard: {e}"))?;
-                cb.set_text(&nfc)
-                    .map_err(|e| anyhow::anyhow!("Failed to write clipboard: {e}"))?;
-                eprintln!("(copied to clipboard)");
+                if clipboard {
+                    let mut cb = arboard::Clipboard::new()
+                        .map_err(|e| anyhow::anyhow!("Failed to open clipboard: {e}"))?;
+                    cb.set_text(&nfc)
+                        .map_err(|e| anyhow::anyhow!("Failed to write clipboard: {e}"))?;
+                    eprintln!("(copied to clipboard)");
+                }
             }
         }
 
