@@ -37,7 +37,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `uninorm check <TEXT>` — exit 1 if text is not NFC
 - `uninorm log [-n N]` — show recent conversion log (default: last 50 entries)
 - `uninorm status` — show daemon status, autostart state, watch entry summary, and recent activity
-- Auto-register autostart on first run of any command
+- `uninorm files --json` — output results as JSON for scripting/CI
+- `uninorm check --json` — output NFC check result as JSON
+- `uninorm convert --json` — output conversion result as JSON
+- `uninorm status --json` — output daemon status as JSON
+- CLI helper functions (`parse_size`, `format_size`, `parse_indices`) extracted to lib with unit tests
+
+#### uninorm-core
+- `ConvertError::PermissionDenied`, `ContentTooLarge`, `RenameConflict` error variants
+- `ConvertError::path()` and `is_permission_error()` helper methods
+- `ConversionStats.files_skipped` and `directories_scanned` fields
+- `Display` trait implementation for `ConversionStats`
+- `MAX_WALK_DEPTH = 256` constant shared between CLI and daemon
+- Doc-tests for `to_nfc`, `to_nfc_filename`, `is_nfc`, `needs_filename_conversion`, `convert_text`, `compile_excludes`, `is_excluded`
+- Criterion benchmarks for normalize, convert_text, and compile_excludes
 
 #### uninorm-daemon
 - Background daemon with filesystem watching (FSEvents on macOS, inotify on Linux)
@@ -51,7 +64,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - UID/GID preservation during content conversion on Unix
 - Non-UTF-8 filenames safely skipped with log message
 
+### Changed
+
+- Removed silent auto-install of autostart on every CLI command (users must explicitly opt-in via `uninorm autostart on`)
+- Reduced scan_path concurrent file reads from 32 to 8 to limit peak memory usage
+- CI clippy now checks benchmark targets (`--all-targets`)
+
 ### Fixed
 
 #### uninorm-cli
 - `uninorm files` now exits with code 1 when any rename or content-write error occurs (previously always exited 0)
+
+#### uninorm-daemon
+- `DaemonError::UnsupportedPlatform` message now correctly says "macOS and Linux" (was "macOS" only)
+- `DaemonController::stop` returns error when daemon fails to exit after SIGTERM (was silent success)
+- Daemon chown failure now logs a warning instead of being silently ignored
+- Filter out `Name(From)` rename events to reduce unnecessary syscalls
+
+### Security
+
+- PID file: use `O_CREAT|O_EXCL` exclusive create to prevent concurrent daemon start race condition
+- PID file: reject symlinks at PID path to prevent symlink-following attacks
+- Temp files: create with mode `0o600` on Unix to prevent content exposure during write-rename window
+- Fix temp file leak on write failure in `convert_single_content`
+- LaunchAgent plist: XML-escape executable and log paths to prevent injection
+- Systemd unit: escape spaces in `ExecStart` path per systemd.service(5) spec
