@@ -69,9 +69,11 @@ impl DaemonController {
                     return Ok(());
                 }
             }
-            // Daemon didn't exit gracefully — still report OK but remove stale PID
+            // Daemon didn't exit gracefully — remove stale PID but warn caller
             config::remove_pid();
-            Ok(())
+            Err(DaemonError::Io(std::io::Error::other(
+                "daemon did not exit after SIGTERM (PID file removed, process may still be running)",
+            )))
         }
     }
 

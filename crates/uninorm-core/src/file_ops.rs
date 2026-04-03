@@ -336,6 +336,36 @@ pub async fn convert_path(
     Ok(stats)
 }
 
+/// Write data to a temp file with restrictive permissions (0o600 on Unix).
+/// Prevents exposure of file contents to other local users during the
+/// write-then-rename atomic update pattern.
+async fn write_temp_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path.to_path_buf();
+        let data = data.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            f.write_all(&data)?;
+            f.sync_data()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("join error: {e}")))?
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, data).await
+    }
+}
+
 /// Convert a single file's content from NFD to NFC.
 /// Returns Err(message) on non-fatal errors that should be recorded.
 async fn convert_single_content(
@@ -369,7 +399,9 @@ async fn convert_single_content(
                         ));
                     };
                     let tmp_path = parent.join(temp_name());
-                    match tokio::fs::write(&tmp_path, nfc_content.as_bytes()).await {
+                    // Create temp file with restrictive permissions (0o600) to prevent
+                    // exposure of file contents to other local users.
+                    match write_temp_file(&tmp_path, nfc_content.as_bytes()).await {
                         Ok(_) => {
                             if let Ok(meta) = tokio::fs::metadata(path).await {
                                 let _ =
@@ -387,6 +419,7 @@ async fn convert_single_content(
                             }
                         }
                         Err(e) => {
+                            let _ = tokio::fs::remove_file(&tmp_path).await;
                             return Err(format!("Content write failed {}: {e}", path.display()));
                         }
                     }

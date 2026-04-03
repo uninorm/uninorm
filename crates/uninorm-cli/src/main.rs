@@ -301,16 +301,6 @@ fn read_tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<Stri
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Auto-register autostart on first run of any command
-    if !uninorm_daemon::autostart::is_installed() {
-        if let Err(e) = uninorm_daemon::autostart::install() {
-            match e {
-                DaemonError::UnsupportedPlatform => {}
-                e => eprintln!("Warning: could not install autostart: {e}"),
-            }
-        }
-    }
-
     match cli.command {
         // -- files: batch convert --
         Commands::Files {

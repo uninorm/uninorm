@@ -78,6 +78,16 @@ pub fn autostart_path() -> Option<PathBuf> {
     }
 }
 
+/// XML-escape a string for safe embedding in plist XML values.
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 // -- macOS LaunchAgent --
 
 #[cfg(target_os = "macos")]
@@ -97,6 +107,9 @@ fn install_launchagent(exe: &std::path::Path) -> Result<(), DaemonError> {
     let log_path = crate::config::log_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "/tmp/uninorm.log".to_string());
+
+    let exe_escaped = xml_escape(&exe.display().to_string());
+    let log_escaped = xml_escape(&log_path);
 
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -121,8 +134,8 @@ fn install_launchagent(exe: &std::path::Path) -> Result<(), DaemonError> {
 </dict>
 </plist>
 "#,
-        exe = exe.display(),
-        log = log_path,
+        exe = exe_escaped,
+        log = log_escaped,
     );
 
     std::fs::write(&plist_path, plist).map_err(|e| {

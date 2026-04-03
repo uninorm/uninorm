@@ -170,7 +170,33 @@ pub fn write_pid(pid: u32) -> Result<()> {
             source: e,
         })?;
     }
-    std::fs::write(&path, pid.to_string()).map_err(|e| ConfigError::Io {
+
+    // Reject symlinks at PID path to prevent symlink-following attacks
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return Err(ConfigError::Io {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "PID file path is a symlink",
+                ),
+            });
+        }
+        // Stale PID file exists (not a symlink) — remove before exclusive create
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Use exclusive create (O_CREAT | O_EXCL) to prevent race between concurrent starts
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| ConfigError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+    write!(f, "{pid}").map_err(|e| ConfigError::Io {
         path: path.clone(),
         source: e,
     })?;
