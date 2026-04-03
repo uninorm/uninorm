@@ -1,6 +1,6 @@
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 
-.PHONY: build test install clean fmt clippy check
+.PHONY: build test install clean fmt clippy check bench
 
 # ── Development ───────────────────────────────────────────────────────────────
 
@@ -14,12 +14,15 @@ fmt:
 	cargo fmt --all
 
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 ## Run fmt, clippy, and test (pre-push checklist)
 check: fmt
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
+
+bench:
+	cargo bench --package uninorm-core
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 

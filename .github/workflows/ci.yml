@@ -54,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install X11 libs
         run: sudo apt-get update -q && sudo apt-get install -y libxcb-shape0-dev libxcb-xfixes0-dev
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
     name: Rustfmt
