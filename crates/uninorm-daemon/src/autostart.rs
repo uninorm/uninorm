@@ -189,6 +189,8 @@ fn install_systemd_unit(exe: &std::path::Path) -> Result<(), DaemonError> {
         })?;
     }
 
+    // Escape spaces per systemd.service(5) spec
+    let exe_str = exe.display().to_string().replace(' ', "\\x20");
     let unit = format!(
         r#"[Unit]
 Description=uninorm NFD→NFC file watcher daemon
@@ -203,7 +205,7 @@ RestartSec=5
 [Install]
 WantedBy=default.target
 "#,
-        exe = exe.display(),
+        exe = exe_str,
     );
 
     std::fs::write(&unit_path, unit).map_err(|e| {
