@@ -390,7 +390,14 @@ fn convert_content_if_needed(path: &Path, max_bytes: u64) -> Option<ContentResul
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let _ = std::os::unix::fs::chown(&tmp_path, Some(meta.uid()), Some(meta.gid()));
+                if let Err(e) =
+                    std::os::unix::fs::chown(&tmp_path, Some(meta.uid()), Some(meta.gid()))
+                {
+                    append_log(&format!(
+                        "Warning: could not preserve ownership for {}: {e}",
+                        path.display()
+                    ));
+                }
             }
             match std::fs::rename(&tmp_path, path) {
                 Ok(_) => Some(ContentResult::Converted(format!(
@@ -590,12 +597,23 @@ async fn run_daemon_platform() -> std::result::Result<(), DaemonError> {
                     match result {
                         Ok(event) => {
                             use notify::EventKind;
-                            let is_name_event = matches!(
+                            // Skip Name(From) events — the file no longer exists at
+                            // the source path, so checking it wastes syscalls.
+                            let is_rename_from = matches!(
                                 event.kind,
-                                EventKind::Create(_)
-                                | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                                | EventKind::Any
+                                EventKind::Modify(notify::event::ModifyKind::Name(
+                                    notify::event::RenameMode::From
+                                ))
                             );
+                            let is_name_event = !is_rename_from
+                                && matches!(
+                                    event.kind,
+                                    EventKind::Create(_)
+                                        | EventKind::Modify(
+                                            notify::event::ModifyKind::Name(_)
+                                        )
+                                        | EventKind::Any
+                                );
                             let is_data_event = matches!(
                                 event.kind,
                                 EventKind::Modify(notify::event::ModifyKind::Data(_))

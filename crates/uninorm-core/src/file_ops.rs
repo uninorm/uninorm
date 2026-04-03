@@ -562,7 +562,7 @@ pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
             }
             (pe, needs_content)
         })
-        .buffer_unordered(32)
+        .buffer_unordered(8)
         .collect()
         .await;
 
