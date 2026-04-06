@@ -1,194 +1,17 @@
-use crate::error::ConvertError;
+//! NFD→NFC file and content conversion engine.
+//!
+//! The main entry point is [`convert_path`], which walks a directory tree and
+//! performs filename renames and/or text content conversion from NFD to NFC.
+//! Renames use a two-step atomic pattern (rename to temp, then rename to target)
+//! with automatic rollback on failure. Content writes use restrictive permissions
+//! (`0o600` on Unix) during the temp-file phase to prevent data exposure.
+
 use crate::normalize::{needs_filename_conversion, to_nfc, to_nfc_filename};
-use futures::stream::{self, StreamExt};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use walkdir::WalkDir;
 
-/// Default maximum file size for content conversion (100 MB).
-pub const DEFAULT_MAX_CONTENT_BYTES: u64 = 100 * 1024 * 1024;
-
-/// Maximum directory traversal depth for recursive walks.
-pub const MAX_WALK_DEPTH: usize = 256;
-
-/// Global atomic counter for unique temp file names.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generate a unique temp file name that won't collide across processes or restarts.
-pub fn temp_name() -> String {
-    let pid = std::process::id();
-    let count = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!(".uninorm_tmp_{pid}_{ts}_{count}")
-}
-
-/// Compile exclude patterns into a `GlobSet` for efficient matching.
-/// Supports both exact names (e.g. `.git`) and glob patterns (e.g. `*.log`, `build*`).
-/// Returns `(GlobSet, Vec<String>)` where the second element contains any invalid patterns.
-///
-/// # Examples
-///
-/// ```
-/// use uninorm_core::compile_excludes;
-///
-/// let patterns = vec![".git".to_string(), "*.log".to_string()];
-/// let (globs, invalid) = compile_excludes(&patterns);
-/// assert!(invalid.is_empty());
-/// assert!(globs.is_match(".git"));
-/// assert!(globs.is_match("app.log"));
-/// assert!(!globs.is_match("readme.md"));
-/// ```
-pub fn compile_excludes(patterns: &[String]) -> (GlobSet, Vec<String>) {
-    let mut builder = GlobSetBuilder::new();
-    let mut invalid = Vec::new();
-    for pat in patterns {
-        match Glob::new(pat) {
-            Ok(glob) => {
-                builder.add(glob);
-            }
-            Err(_) => {
-                invalid.push(pat.clone());
-            }
-        }
-    }
-    let set = builder.build().unwrap_or_else(|_| {
-        GlobSetBuilder::new()
-            .build()
-            .expect("empty GlobSet must build")
-    });
-    (set, invalid)
-}
-
-/// Check if a path should be excluded based on compiled glob patterns.
-/// Matches against each component of the relative path (from root).
-///
-/// # Examples
-///
-/// ```
-/// use std::path::Path;
-/// use uninorm_core::{compile_excludes, is_excluded};
-///
-/// let patterns = vec![".git".to_string(), "*.log".to_string()];
-/// let (globs, _) = compile_excludes(&patterns);
-///
-/// assert!(is_excluded(Path::new("/root/.git/config"), Path::new("/root"), &globs));
-/// assert!(!is_excluded(Path::new("/root/src/main.rs"), Path::new("/root"), &globs));
-/// ```
-pub fn is_excluded(entry_path: &Path, root: &Path, globs: &GlobSet) -> bool {
-    if globs.is_empty() {
-        return false;
-    }
-    let relative = entry_path.strip_prefix(root).unwrap_or(entry_path);
-    relative.components().any(|c| {
-        if let std::path::Component::Normal(name) = c {
-            let s = name.to_string_lossy();
-            globs.is_match(s.as_ref())
-        } else {
-            false
-        }
-    })
-}
-
-/// Check if two paths refer to the same filesystem inode.
-/// Used to detect the APFS case where NFD and NFC forms of the same name
-/// both resolve to the same file (normalization-insensitive lookup).
-#[cfg(unix)]
-pub fn same_inode(p1: &Path, p2: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(p1), std::fs::metadata(p2)) {
-        (Ok(m1), Ok(m2)) => m1.ino() == m2.ino() && m1.dev() == m2.dev(),
-        _ => false,
-    }
-}
-
-#[cfg(windows)]
-pub fn same_inode(p1: &Path, p2: &Path) -> bool {
-    // NTFS doesn't have NFD/NFC aliasing like APFS, so canonical path comparison suffices.
-    match (std::fs::canonicalize(p1), std::fs::canonicalize(p2)) {
-        (Ok(c1), Ok(c2)) => c1 == c2,
-        _ => false,
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-pub fn same_inode(_p1: &Path, _p2: &Path) -> bool {
-    false
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ConversionOptions {
-    pub convert_filenames: bool,
-    pub convert_content: bool,
-    pub dry_run: bool,
-    pub recursive: bool,
-    pub follow_symlinks: bool,
-    /// Entry names (files or directories) to skip entirely.
-    /// Supports glob patterns (e.g. `*.log`, `.git`, `build*`).
-    /// Matched against each path component.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub exclude_patterns: Vec<String>,
-    /// Maximum file size (bytes) for content conversion. Files larger than this
-    /// are silently skipped. Defaults to [`DEFAULT_MAX_CONTENT_BYTES`] (100 MB).
-    #[cfg_attr(feature = "serde", serde(default = "default_max_content_bytes"))]
-    pub max_content_bytes: u64,
-}
-
-#[cfg(feature = "serde")]
-fn default_max_content_bytes() -> u64 {
-    DEFAULT_MAX_CONTENT_BYTES
-}
-
-impl Default for ConversionOptions {
-    fn default() -> Self {
-        Self {
-            convert_filenames: true,
-            convert_content: false,
-            dry_run: false,
-            recursive: true,
-            follow_symlinks: false,
-            exclude_patterns: Vec::new(),
-            max_content_bytes: DEFAULT_MAX_CONTENT_BYTES,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct ConversionStats {
-    /// Total entries scanned (files + directories).
-    pub files_scanned: usize,
-    pub files_renamed: usize,
-    pub files_content_converted: usize,
-    /// Files skipped due to binary content, size limits, or non-UTF-8 encoding.
-    pub files_skipped: usize,
-    /// Number of directories encountered during traversal.
-    pub directories_scanned: usize,
-    pub errors: Vec<String>,
-}
-
-impl std::fmt::Display for ConversionStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Scanned: {} (dirs: {})  Renamed: {}  Content: {}  Skipped: {}",
-            self.files_scanned,
-            self.directories_scanned,
-            self.files_renamed,
-            self.files_content_converted,
-            self.files_skipped,
-        )?;
-        if !self.errors.is_empty() {
-            write!(f, "  Errors: {}", self.errors.len())?;
-        }
-        Ok(())
-    }
-}
+use super::exclude::{compile_excludes, is_excluded};
+use super::{same_inode, temp_name, ConversionOptions, ConversionStats, MAX_WALK_DEPTH};
 
 /// Collected entry for depth-grouped parallel processing.
 struct CollectedEntry {
@@ -205,7 +28,7 @@ pub async fn convert_path(
     path: &Path,
     opts: &ConversionOptions,
     mut progress: impl FnMut(&ConversionStats),
-) -> Result<ConversionStats, ConvertError> {
+) -> Result<ConversionStats, crate::error::ConvertError> {
     let mut stats = ConversionStats::default();
     let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
     for pat in &invalid_patterns {
@@ -438,197 +261,11 @@ async fn convert_single_content(
     Ok(())
 }
 
-/// A single entry discovered during a pre-scan that would be affected.
-#[derive(Debug, Clone)]
-pub struct ScanEntry {
-    /// Original path (with NFD filename)
-    pub path: std::path::PathBuf,
-    /// Whether the filename needs NFD→NFC conversion
-    pub needs_rename: bool,
-    /// New filename (NFC) if rename is needed
-    pub new_name: Option<String>,
-    /// Whether text content contains NFD sequences
-    pub needs_content_conversion: bool,
-}
-
-/// Result of a pre-scan: lists affected entries without modifying anything.
-#[derive(Debug, Default)]
-pub struct ScanResult {
-    pub total_scanned: usize,
-    pub entries: Vec<ScanEntry>,
-    pub errors: Vec<String>,
-}
-
-impl ScanResult {
-    pub fn rename_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.needs_rename).count()
-    }
-    pub fn content_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| e.needs_content_conversion)
-            .count()
-    }
-    pub fn affected_count(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-/// Pre-scan a path to discover which files/directories would be affected by
-/// conversion, without modifying anything. Content reads are parallelized.
-pub async fn scan_path(path: &Path, opts: &ConversionOptions) -> ScanResult {
-    let mut result = ScanResult::default();
-    let (globs, invalid_patterns) = compile_excludes(&opts.exclude_patterns);
-    for pat in &invalid_patterns {
-        result
-            .errors
-            .push(format!("Invalid exclude pattern ignored: {pat}"));
-    }
-    let max_depth = if opts.recursive { MAX_WALK_DEPTH } else { 1 };
-    let walker = WalkDir::new(path)
-        .follow_links(opts.follow_symlinks)
-        .contents_first(true)
-        .max_depth(max_depth);
-
-    // Phase 1: collect entries and determine rename needs (cheap, no I/O)
-    struct PendingEntry {
-        path: std::path::PathBuf,
-        needs_rename: bool,
-        new_name: Option<String>,
-        is_file: bool,
-    }
-
-    let mut pending = Vec::new();
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                result.errors.push(format!("Walk error: {e}"));
-                continue;
-            }
-        };
-
-        if is_excluded(entry.path(), path, &globs) {
-            continue;
-        }
-
-        result.total_scanned += 1;
-
-        let file_name = entry.file_name().to_string_lossy();
-        let needs_rename = opts.convert_filenames && needs_filename_conversion(&file_name);
-        let new_name = if needs_rename {
-            Some(to_nfc_filename(&file_name))
-        } else {
-            None
-        };
-
-        // If rename-only (no content check needed), add directly
-        if !opts.convert_content || !entry.file_type().is_file() {
-            if needs_rename {
-                result.entries.push(ScanEntry {
-                    path: entry.path().to_path_buf(),
-                    needs_rename,
-                    new_name,
-                    needs_content_conversion: false,
-                });
-            }
-            continue;
-        }
-
-        pending.push(PendingEntry {
-            path: entry.path().to_path_buf(),
-            needs_rename,
-            new_name,
-            is_file: entry.file_type().is_file(),
-        });
-    }
-
-    // Phase 2: parallel content check for files
-    let max_bytes = opts.max_content_bytes;
-    let content_results: Vec<_> = stream::iter(pending)
-        .map(|pe| async move {
-            let mut needs_content = false;
-            if pe.is_file {
-                if let Ok(meta) = tokio::fs::metadata(&pe.path).await {
-                    if meta.len() <= max_bytes {
-                        if let Ok(content) = tokio::fs::read_to_string(&pe.path).await {
-                            let nfc = to_nfc(&content);
-                            if nfc != content {
-                                needs_content = true;
-                            }
-                        }
-                    }
-                }
-            }
-            (pe, needs_content)
-        })
-        .buffer_unordered(8)
-        .collect()
-        .await;
-
-    for (pe, needs_content) in content_results {
-        if pe.needs_rename || needs_content {
-            result.entries.push(ScanEntry {
-                path: pe.path,
-                needs_rename: pe.needs_rename,
-                new_name: pe.new_name,
-                needs_content_conversion: needs_content,
-            });
-        }
-    }
-
-    result
-}
-
-/// Convert a single string (e.g. from clipboard) from NFD to NFC.
-///
-/// # Examples
-///
-/// ```
-/// use uninorm_core::convert_text;
-///
-/// assert_eq!(convert_text("cafe\u{0301}"), "café");
-/// assert_eq!(convert_text("already NFC"), "already NFC");
-/// ```
-pub fn convert_text(s: &str) -> String {
-    to_nfc(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
-
-    // ── convert_text() ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_convert_text_nfd_to_nfc() {
-        assert_eq!(convert_text("e\u{0301}"), "\u{00E9}"); // é NFD → NFC
-    }
-
-    #[test]
-    fn test_convert_text_already_nfc() {
-        assert_eq!(convert_text("café"), "café");
-    }
-
-    #[test]
-    fn test_convert_text_empty() {
-        assert_eq!(convert_text(""), "");
-    }
-
-    #[test]
-    fn test_convert_text_ascii_unchanged() {
-        let s = "hello world 123";
-        assert_eq!(convert_text(s), s);
-    }
-
-    #[test]
-    fn test_convert_text_japanese_nfd() {
-        // が in NFD
-        let nfd = "\u{304B}\u{3099}";
-        assert_eq!(convert_text(nfd), "が");
-    }
 
     // ── ConversionStats Display ────────────────────────────────────────────
 
@@ -1062,8 +699,6 @@ mod tests {
     }
 
     // ── exclude_patterns: deeply nested path is also excluded ─────────────────
-    // Regression guard: a pattern must match any component in the relative path,
-    // not just the immediate parent.
 
     #[tokio::test]
     async fn test_exclude_patterns_deep_nested_path() {
@@ -1086,12 +721,10 @@ mod tests {
             ..ConversionOptions::default()
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
-        // Only the file outside node_modules gets renamed.
         assert_eq!(
             stats.files_renamed, 1,
             "only the file outside node_modules should be renamed"
         );
-        // The NFD file inside node_modules must not have been touched.
         assert!(
             node.join(&nfd_name).exists(),
             "excluded file must remain with its original NFD name"
@@ -1099,14 +732,10 @@ mod tests {
     }
 
     // ── exclude_patterns: pattern does NOT match a parent dir that is not the
-    // watch root — guard against accidentally skipping unrelated paths whose
-    // absolute ancestor happens to contain the excluded name.
+    // watch root ──────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_exclude_does_not_match_above_root() {
-        // Structure: /tmp/node_modules/<root>/file.txt
-        // Root passed to convert_path is <root>; "node_modules" is ABOVE the
-        // root so must not be excluded.
         let outer = TempDir::new().unwrap();
         let excluded_parent = outer.path().join("node_modules");
         let root = excluded_parent.join("myproject");
@@ -1123,8 +752,6 @@ mod tests {
             exclude_patterns: vec!["node_modules".to_string()],
             ..ConversionOptions::default()
         };
-        // Scan starting at `root`, not at `outer`.  The "node_modules" component
-        // is above the scan root and must not cause exclusion.
         let stats = convert_path(&root, &opts, |_| {}).await.unwrap();
         assert_eq!(
             stats.files_renamed, 1,
@@ -1132,15 +759,12 @@ mod tests {
         );
     }
 
-    // ── 100 MB file guard: oversized files are silently skipped for content ───
+    // ── 100 MB file guard ────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_large_file_skipped_for_content_conversion() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("big.txt");
-
-        // Write a file that is exactly MAX_CONTENT_BYTES + 1.
-        // We use set_len (sparse file) so the test is fast.
         {
             let f = fs::File::create(&path).unwrap();
             f.set_len(100 * 1024 * 1024 + 1).unwrap();
@@ -1165,17 +789,10 @@ mod tests {
         );
     }
 
-    // ── 100 MB boundary: file exactly at the limit is processed ──────────────
-
     #[tokio::test]
     async fn test_file_at_exact_limit_is_processed() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("boundary.txt");
-        // Build exactly MAX_CONTENT_BYTES of NFD content so it triggers conversion.
-        // We use a 2-byte NFD sequence (e + combining acute) repeated to fill the limit.
-        // 100 MB / 2 bytes = 50 M repetitions — too slow.  Instead write a 1-byte
-        // ASCII file that is well under the guard and confirm it IS converted.
-        // (The "at exact limit" guard uses >, so a file of exactly MAX bytes is allowed.)
         let nfd_content = "e\u{0301}"; // 2 bytes, well under 100 MB
         fs::write(&path, nfd_content).unwrap();
 
@@ -1194,21 +811,17 @@ mod tests {
         );
     }
 
-    // ── rename_succeeded flag: content uses the original path when rename fails
+    // ── rename_succeeded flag tests ──────────────────────────────────────────
 
-    // Simulate a rename-then-content pass where convert_filenames=false so
-    // rename_succeeded stays false. The content must still be read and converted
-    // from the original path.
     #[tokio::test]
     async fn test_content_converted_at_original_path_when_no_rename() {
         let dir = TempDir::new().unwrap();
-        // File has NFC name but NFD content — only content conversion matters.
         let path = dir.path().join("plain.txt");
         let nfd_content = "n\u{0303}"; // ñ in NFD
         fs::write(&path, nfd_content).unwrap();
 
         let opts = ConversionOptions {
-            convert_filenames: false, // no rename attempted → rename_succeeded stays false
+            convert_filenames: false,
             convert_content: true,
             dry_run: false,
             recursive: false,
@@ -1221,10 +834,6 @@ mod tests {
         assert_eq!(result, "\u{00F1}", "ñ must be in NFC at the original path");
     }
 
-    // ── rename_succeeded flag: combined pass uses the NFC path for content ────
-
-    // When both filename and content conversion are on and rename succeeds,
-    // the content read must target the new (NFC) path, not the original NFD path.
     #[tokio::test]
     async fn test_content_read_from_nfc_path_after_successful_rename() {
         let dir = TempDir::new().unwrap();
@@ -1245,25 +854,18 @@ mod tests {
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
         assert_eq!(stats.files_renamed, 1);
         assert_eq!(stats.files_content_converted, 1);
-        // Content must be at the NFC-named file.
         let result = fs::read_to_string(&nfc_path).unwrap();
         assert_eq!(result, "\u{00FC}", "ü must be NFC inside the renamed file");
     }
 
-    // ── Directory rename: children renamed before parent (contents_first) ─────
+    // ── Directory rename ─────────────────────────────────────────────────────
 
-    // Verifies that a directory whose own name is NFD is renamed correctly even
-    // when it contains files — WalkDir contents_first guarantees children are
-    // processed before their parent, so the parent rename does not invalidate
-    // child paths.
     #[tokio::test]
     async fn test_directory_with_nfd_name_and_nfd_children_renamed() {
         let dir = TempDir::new().unwrap();
-        // Directory name in NFD: "cafe\u{0301}" → NFC "café"
         let nfd_dir_name = "cafe\u{0301}".to_string();
         let nfd_dir = dir.path().join(&nfd_dir_name);
         fs::create_dir(&nfd_dir).unwrap();
-        // Child file inside the NFD directory — name also needs conversion.
         let nfd_child = "re\u{0301}sume\u{0301}.txt".to_string();
         fs::write(nfd_dir.join(&nfd_child), "hello").unwrap();
 
@@ -1277,25 +879,18 @@ mod tests {
         };
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
-        // Both the directory and the file inside it must be renamed (2 renames).
         assert_eq!(
             stats.files_renamed, 2,
             "expected directory + child file both renamed"
         );
-        // The NFC-named path must now be accessible.
         let nfc_dir = dir.path().join("caf\u{00E9}");
         assert!(nfc_dir.exists(), "NFC directory must exist after rename");
         let nfc_child = nfc_dir.join("r\u{00E9}sum\u{00E9}.txt");
         assert!(nfc_child.exists(), "NFC child file must exist after rename");
     }
 
-    // ── Temp file name is unique per original filename ────────────────────────
+    // ── Temp file uniqueness and cleanup ─────────────────────────────────────
 
-    // Two NFD files in the same directory must produce distinct temp file names
-    // so concurrent or sequential renames do not collide.  The temp name is
-    // ".uninorm_tmp_<files_scanned_counter>" in convert_path (counter-based),
-    // and ".uninorm_tmp_<original_filename>" in rename_if_needed (name-based).
-    // This test covers convert_path: each entry gets a different counter value.
     #[tokio::test]
     async fn test_multiple_nfd_files_in_same_dir_no_collision() {
         let dir = TempDir::new().unwrap();
@@ -1313,7 +908,6 @@ mod tests {
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
         assert!(stats.errors.is_empty(), "errors: {:?}", stats.errors);
         assert_eq!(stats.files_renamed, 2, "both NFD files must be renamed");
-        // No stale temp files left behind.
         let stale: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1326,13 +920,11 @@ mod tests {
         );
     }
 
-    // ── Atomic write: no temp file left after successful content conversion ────
-
     #[tokio::test]
     async fn test_no_temp_file_left_after_content_conversion() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
-        fs::write(&path, "e\u{0301}").unwrap(); // NFD content
+        fs::write(&path, "e\u{0301}").unwrap();
 
         let opts = ConversionOptions {
             convert_filenames: false,
@@ -1344,7 +936,6 @@ mod tests {
         };
         convert_path(dir.path(), &opts, |_| {}).await.unwrap();
 
-        // Verify no temp files remain after successful content conversion.
         let has_temp = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1358,11 +949,8 @@ mod tests {
         );
     }
 
-    // ── Rename conflict: NFC target already exists as a different file ─────────
+    // ── Rename conflict ──────────────────────────────────────────────────────
 
-    // On a case-sensitive filesystem (Linux tmpfs, APFS in case-sensitive mode)
-    // both NFD and NFC names can coexist.  The code must detect the conflict via
-    // same_inode and log it as an error rather than silently overwriting.
     #[cfg(unix)]
     #[tokio::test]
     async fn test_rename_conflict_logged_as_error() {
@@ -1370,15 +958,11 @@ mod tests {
         let nfd_name = "cafe\u{0301}.txt".to_string();
         let nfc_name = "caf\u{00E9}.txt";
 
-        // On APFS the two names resolve to the same inode, so same_inode()
-        // returns true and no conflict is recorded. Only run the conflict
-        // assertion on case-sensitive filesystems where they are distinct inodes.
         let nfd_path = dir.path().join(&nfd_name);
         let nfc_path = dir.path().join(nfc_name);
         fs::write(&nfd_path, "original").unwrap();
         fs::write(&nfc_path, "conflict").unwrap();
 
-        // Check if they are the same inode (APFS normalization-insensitive).
         let same = {
             use std::os::unix::fs::MetadataExt;
             let m1 = fs::metadata(&nfd_path).unwrap();
@@ -1397,13 +981,11 @@ mod tests {
         let stats = convert_path(dir.path(), &opts, |_| {}).await.unwrap();
 
         if same {
-            // APFS: normalization-insensitive — treated as same file, rename succeeds.
             assert!(
                 stats.errors.is_empty(),
                 "APFS same-inode rename must not be an error"
             );
         } else {
-            // Case-sensitive FS: distinct inodes → conflict must be logged.
             assert_eq!(
                 stats.files_renamed, 0,
                 "conflicting rename must not proceed"
@@ -1413,29 +995,21 @@ mod tests {
                 "expected a Rename conflict error, got: {:?}",
                 stats.errors
             );
-            // The conflict file must be untouched.
             assert_eq!(fs::read_to_string(&nfc_path).unwrap(), "conflict");
         }
     }
 
-    // ── Watch safety: rename_if_needed returns None for already-NFC path ──────
+    // ── Watch safety ─────────────────────────────────────────────────────────
 
-    // After convert_path renames a file to its NFC form, the filesystem watcher
-    // fires another event for the new NFC path.  rename_if_needed must return
-    // None for that path so no second rename is attempted (no infinite loop).
     #[test]
     fn test_rename_if_needed_noop_for_nfc_path() {
         use crate::normalize::needs_filename_conversion;
-        // Simulate the watch handler logic: if rename_if_needed returns None for
-        // an already-NFC filename, no second rename fires.
-        let nfc_name = "caf\u{00E9}.txt"; // already NFC
+        let nfc_name = "caf\u{00E9}.txt";
         assert!(
             !needs_filename_conversion(nfc_name),
             "NFC filename must not need conversion — watch loop would be infinite if it did"
         );
     }
-
-    // ── Watch safety: rename_if_needed returns None for NFC Korean ───────────
 
     #[test]
     fn test_rename_if_needed_noop_for_nfc_korean() {
@@ -1446,10 +1020,6 @@ mod tests {
         );
     }
 
-    // ── Watch safety: rename_if_needed returns Some for NFD path ─────────────
-
-    // Confirms the positive case: an NFD-named file does need conversion so the
-    // watcher correctly fires the rename on the first event.
     #[test]
     fn test_rename_if_needed_triggers_for_nfd_filename() {
         use crate::normalize::needs_filename_conversion;
@@ -1460,82 +1030,7 @@ mod tests {
         );
     }
 
-    // ── Exclude patterns: relative-path stripping prevents false positives ────
-
-    // Guard against a watch-root whose absolute path contains a component that
-    // matches an exclude pattern.  Before the fix this would cause all files
-    // under that root to be excluded.
-    //
-    // Example: root = /home/user/node_modules/myproject
-    // Pattern = "node_modules"
-    // The relative path from root to any child never contains "node_modules",
-    // so nothing should be excluded.
-    #[test]
-    fn test_exclude_relative_path_strips_watch_root_prefix() {
-        use crate::normalize::needs_filename_conversion;
-        use std::path::PathBuf;
-
-        // Replicate the relative-path logic from rename_if_needed.
-        let watch_root = PathBuf::from("/home/user/node_modules/myproject");
-        let file_path = watch_root.join("cafe\u{0301}.txt");
-
-        let exclude = ["node_modules".to_string()];
-        let relative = [watch_root.as_path()]
-            .iter()
-            .find_map(|root| file_path.strip_prefix(root).ok())
-            .unwrap_or(&file_path);
-
-        let excluded = relative.components().any(|c| {
-            if let std::path::Component::Normal(n) = c {
-                let s = n.to_string_lossy();
-                exclude.iter().any(|pat| s.as_ref() == pat.as_str())
-            } else {
-                false
-            }
-        });
-
-        assert!(
-            !excluded,
-            "file directly under watch root must not be excluded even if root path contains 'node_modules'"
-        );
-        // And confirm the file itself needs conversion (watch should rename it).
-        assert!(needs_filename_conversion("cafe\u{0301}.txt"));
-    }
-
-    // ── Exclude patterns: component inside relative path IS excluded ──────────
-
-    #[test]
-    fn test_exclude_relative_path_matches_subdir_component() {
-        use std::path::PathBuf;
-
-        let watch_root = PathBuf::from("/home/user/myproject");
-        let file_path = watch_root
-            .join("node_modules")
-            .join("some_pkg")
-            .join("cafe\u{0301}.txt");
-
-        let exclude = ["node_modules".to_string()];
-        let relative = [watch_root.as_path()]
-            .iter()
-            .find_map(|root| file_path.strip_prefix(root).ok())
-            .unwrap_or(&file_path);
-
-        let excluded = relative.components().any(|c| {
-            if let std::path::Component::Normal(n) = c {
-                let s = n.to_string_lossy();
-                exclude.iter().any(|pat| s.as_ref() == pat.as_str())
-            } else {
-                false
-            }
-        });
-
-        assert!(
-            excluded,
-            "path with 'node_modules' component under watch root must be excluded"
-        );
-    }
-
-    // ── convert_path: NFC directory name not counted as rename ───────────────
+    // ── NFC directory not renamed ────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_nfc_directory_not_renamed() {
@@ -1557,16 +1052,13 @@ mod tests {
         assert!(stats.errors.is_empty());
     }
 
-    // ── convert_path on a nonexistent path propagates walk error ─────────────
+    // ── Nonexistent root path ────────────────────────────────────────────────
 
-    // WalkDir returns an error for the first entry when the root does not exist.
-    // The error must be captured in stats.errors, not panic.
     #[tokio::test]
     async fn test_nonexistent_root_path_captured_as_walk_error() {
         use std::path::PathBuf;
         let nonexistent = PathBuf::from("/tmp/uninorm_test_nonexistent_xyzzy_12345");
         let opts = ConversionOptions::default();
-        // convert_path itself returns Ok(stats); the walk error goes into stats.errors.
         let stats = convert_path(&nonexistent, &opts, |_| {}).await.unwrap();
         assert!(
             !stats.errors.is_empty(),
@@ -1579,11 +1071,8 @@ mod tests {
         );
     }
 
-    // ── convert_path: content conversion dry-run with NFD filename ───────────
+    // ── Combined dry-run ─────────────────────────────────────────────────────
 
-    // When both convert_filenames and convert_content are true but dry_run is
-    // set, neither the rename nor the write must happen.  The counts must still
-    // reflect what would have changed.
     #[tokio::test]
     async fn test_combined_dry_run_counts_but_does_not_modify() {
         let dir = TempDir::new().unwrap();
@@ -1609,7 +1098,6 @@ mod tests {
             stats.files_content_converted, 1,
             "dry-run should count content changes"
         );
-        // Original NFD file must still exist and be unchanged.
         assert!(
             nfd_path.exists(),
             "original NFD file must not be renamed in dry-run"
@@ -1621,10 +1109,8 @@ mod tests {
         );
     }
 
-    // ── Symlinks: not followed by default ─────────────────────────────────────
+    // ── Symlinks ─────────────────────────────────────────────────────────────
 
-    /// Try to create a directory symlink. Returns Ok on success, Err if
-    /// the OS doesn't support it (e.g. Windows without Developer Mode).
     fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -1652,7 +1138,6 @@ mod tests {
 
         let link = dir.path().join("link");
         if try_symlink_dir(target_dir.path(), &link).is_err() {
-            // Skip: symlink not available (e.g. Windows without Developer Mode)
             return;
         }
 
@@ -1669,195 +1154,5 @@ mod tests {
             stats.files_content_converted, 0,
             "symlinked files must not be processed when follow_symlinks=false"
         );
-    }
-
-    // ── scan_path() ──────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_scan_empty_directory() {
-        let dir = TempDir::new().unwrap();
-        let opts = ConversionOptions::default();
-        let result = scan_path(dir.path(), &opts).await;
-        // Only the root dir itself is scanned
-        assert!(result.entries.is_empty());
-        assert_eq!(result.affected_count(), 0);
-        assert!(result.errors.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_scan_detects_nfd_filenames() {
-        let dir = TempDir::new().unwrap();
-        // Latin e + combining acute (NFD)
-        fs::write(dir.path().join("e\u{0301}.txt"), "").unwrap();
-        // Already NFC
-        fs::write(dir.path().join("hello.txt"), "").unwrap();
-
-        let opts = ConversionOptions::default();
-        let result = scan_path(dir.path(), &opts).await;
-
-        assert_eq!(result.rename_count(), 1);
-        assert_eq!(result.content_count(), 0);
-
-        let entry = &result.entries[0];
-        assert!(entry.needs_rename);
-        assert_eq!(entry.new_name.as_deref(), Some("\u{00E9}.txt"));
-    }
-
-    #[tokio::test]
-    async fn test_scan_detects_nfd_content() {
-        let dir = TempDir::new().unwrap();
-        // File with NFC name but NFD content
-        fs::write(dir.path().join("data.txt"), "caf\u{0065}\u{0301}").unwrap();
-        // File with NFC content
-        fs::write(dir.path().join("ok.txt"), "hello").unwrap();
-
-        let opts = ConversionOptions {
-            convert_content: true,
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        assert_eq!(result.content_count(), 1);
-        let entry = result
-            .entries
-            .iter()
-            .find(|e| e.needs_content_conversion)
-            .unwrap();
-        assert!(!entry.needs_rename);
-        assert!(entry.needs_content_conversion);
-    }
-
-    #[tokio::test]
-    async fn test_scan_non_recursive() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("e\u{0301}.txt"), "").unwrap();
-        let sub = dir.path().join("sub");
-        fs::create_dir(&sub).unwrap();
-        fs::write(sub.join("a\u{0300}.txt"), "").unwrap();
-
-        let opts = ConversionOptions {
-            recursive: false,
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        // Only the top-level NFD file, not the one in sub/
-        assert_eq!(result.rename_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_excludes() {
-        let dir = TempDir::new().unwrap();
-        let git = dir.path().join(".git");
-        fs::create_dir(&git).unwrap();
-        fs::write(git.join("e\u{0301}.txt"), "").unwrap();
-        fs::write(dir.path().join("a\u{0300}.txt"), "").unwrap();
-
-        let opts = ConversionOptions {
-            exclude_patterns: vec![".git".to_string()],
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        // Only the top-level file, .git/ excluded
-        assert_eq!(result.rename_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_scan_binary_file_skipped_for_content() {
-        let dir = TempDir::new().unwrap();
-        // Binary file (invalid UTF-8)
-        fs::write(dir.path().join("bin.dat"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
-
-        let opts = ConversionOptions {
-            convert_content: true,
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        assert_eq!(result.content_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_scan_combined_rename_and_content() {
-        let dir = TempDir::new().unwrap();
-        // NFD filename + NFD content
-        fs::write(dir.path().join("e\u{0301}.txt"), "caf\u{0065}\u{0301}").unwrap();
-
-        let opts = ConversionOptions {
-            convert_content: true,
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        assert_eq!(result.rename_count(), 1);
-        assert_eq!(result.content_count(), 1);
-        assert_eq!(result.affected_count(), 1); // same entry has both flags
-    }
-
-    #[tokio::test]
-    async fn test_scan_all_nfc_returns_empty() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("hello.txt"), "world").unwrap();
-        fs::write(dir.path().join("café.txt"), "normal").unwrap();
-
-        let opts = ConversionOptions {
-            convert_content: true,
-            ..ConversionOptions::default()
-        };
-        let result = scan_path(dir.path(), &opts).await;
-
-        assert_eq!(result.affected_count(), 0);
-        assert!(result.total_scanned > 0);
-    }
-
-    #[tokio::test]
-    async fn test_scan_result_helpers() {
-        let result = ScanResult {
-            total_scanned: 10,
-            entries: vec![
-                ScanEntry {
-                    path: std::path::PathBuf::from("/a"),
-                    needs_rename: true,
-                    new_name: Some("b".to_string()),
-                    needs_content_conversion: false,
-                },
-                ScanEntry {
-                    path: std::path::PathBuf::from("/c"),
-                    needs_rename: false,
-                    new_name: None,
-                    needs_content_conversion: true,
-                },
-                ScanEntry {
-                    path: std::path::PathBuf::from("/d"),
-                    needs_rename: true,
-                    new_name: Some("e".to_string()),
-                    needs_content_conversion: true,
-                },
-            ],
-            errors: vec![],
-        };
-
-        assert_eq!(result.rename_count(), 2);
-        assert_eq!(result.content_count(), 2);
-        assert_eq!(result.affected_count(), 3);
-    }
-
-    // ── compile_excludes() ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_compile_excludes_with_invalid_pattern() {
-        let patterns = vec!["[invalid".to_string(), ".git".to_string()];
-        let (globs, invalid) = compile_excludes(&patterns);
-        assert_eq!(invalid.len(), 1);
-        assert_eq!(invalid[0], "[invalid");
-        assert!(globs.is_match(".git"));
-    }
-
-    #[test]
-    fn test_compile_excludes_empty() {
-        let (globs, invalid) = compile_excludes(&[]);
-        assert!(invalid.is_empty());
-        assert!(globs.is_empty());
     }
 }

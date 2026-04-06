@@ -1,3 +1,10 @@
+//! Watch configuration and persistent state management.
+//!
+//! Handles loading, saving, and manipulating the JSON configuration file that
+//! stores watch entries, debounce settings, PID tracking, and log file paths.
+//! The configuration lives at `~/.config/uninorm/config.json` (XDG) or the
+//! platform-equivalent directory.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

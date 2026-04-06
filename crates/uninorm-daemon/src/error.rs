@@ -1,3 +1,9 @@
+//! Error types for daemon and configuration operations.
+//!
+//! [`ConfigError`] covers configuration file I/O and parsing failures.
+//! [`DaemonError`] covers daemon lifecycle issues — spawning, signaling,
+//! watch failures, and platform support.
+
 use std::path::PathBuf;
 
 /// Errors related to configuration file operations.

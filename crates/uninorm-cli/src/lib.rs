@@ -1,3 +1,9 @@
+//! Helper utilities for the `uninorm` CLI.
+//!
+//! Provides parsing and formatting functions used by the CLI binary:
+//! [`parse_size`] for human-readable byte sizes, [`format_size`] for display,
+//! and [`parse_indices`] for comma-separated entry selection.
+
 /// Parse human-readable size strings like "100MB", "1GB", "500KB", or raw bytes.
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim().to_uppercase();

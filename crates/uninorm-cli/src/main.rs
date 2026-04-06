@@ -1,3 +1,9 @@
+//! CLI binary for the `uninorm` Unicode normalizer.
+//!
+//! Provides subcommands for batch file conversion (`files`), background watching
+//! (`watch`), clipboard conversion (`clipboard`), text checking (`check`/`convert`),
+//! daemon management (`daemon`), and autostart configuration (`autostart`).
+
 use std::io::Write;
 use std::path::PathBuf;
 

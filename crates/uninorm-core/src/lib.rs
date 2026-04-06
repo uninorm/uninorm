@@ -1,3 +1,17 @@
+//! Core library for Unicode NFD→NFC normalization.
+//!
+//! `uninorm-core` provides cross-platform utilities for converting filenames and text
+//! content from Unicode NFD (Normalization Form Decomposed) to NFC (Normalization Form
+//! Composed). On macOS, it handles the non-standard HFS+/APFS NFD variant that
+//! decomposes Korean Hangul, Japanese kana voiced marks, and Latin diacritics differently
+//! from standard Unicode NFD.
+//!
+//! # Modules
+//!
+//! - [`normalize`] — low-level NFC conversion functions
+//! - [`file_ops`] — directory walking, file renaming, content conversion, and scanning
+//! - [`error`] — error types for conversion operations
+
 pub mod error;
 pub mod file_ops;
 pub mod normalize;

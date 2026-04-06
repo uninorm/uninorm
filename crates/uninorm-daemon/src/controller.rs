@@ -1,3 +1,9 @@
+//! High-level daemon lifecycle controller.
+//!
+//! [`DaemonController`] provides a frontend-agnostic API for starting, stopping,
+//! restarting, and querying the daemon status. It handles PID polling, signal
+//! delivery, and configuration reloading.
+
 use crate::config::{self, WatchConfig};
 use crate::error::DaemonError;
 

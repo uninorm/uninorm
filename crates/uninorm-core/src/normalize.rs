@@ -1,3 +1,9 @@
+//! Unicode NFC normalization functions.
+//!
+//! Provides [`to_nfc`] for standard text content, [`to_nfc_filename`] for filenames
+//! (which uses the `hfs_nfd` crate on macOS to handle the HFS+/APFS NFD variant),
+//! [`is_nfc`] for detection, and [`needs_filename_conversion`] as a convenience check.
+
 use unicode_normalization::UnicodeNormalization;
 
 /// Convert text content from NFD to NFC.

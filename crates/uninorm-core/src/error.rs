@@ -1,3 +1,9 @@
+//! Error types for file conversion operations.
+//!
+//! [`ConvertError`] covers the failure modes that can occur during directory walking,
+//! file renaming, and content conversion — including I/O errors, permission denials,
+//! rename conflicts, and content size limits.
+
 use std::path::{Path, PathBuf};
 
 /// Errors that can occur during file conversion operations.

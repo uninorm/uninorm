@@ -1,3 +1,10 @@
+//! Daemon process implementation.
+//!
+//! Contains [`spawn_daemon`] for launching the background process and
+//! [`run_daemon`] which is the async main loop — it loads the watch configuration,
+//! sets up file-system watchers via the `notify` crate, and processes events with
+//! configurable debouncing.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
